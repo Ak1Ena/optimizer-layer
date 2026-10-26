@@ -10,17 +10,20 @@ The current prototype delivers a bounded goal-to-verification cycle. Improved ef
 
 Requires Node.js 24.18.x.
 
-**1. Build and install (once per machine).**
+**1. Install from the latest release (once per machine).**
+
+Each [GitHub release](https://github.com/Ak1Ena/optimizer-layer/releases) contains the three package tarballs and `SHA256SUMS`. With the GitHub CLI (works for the private repository):
 
 ```sh
-git clone https://github.com/Ak1Ena/optimizer-layer.git
-cd optimizer-layer
-nvm use
-npm ci
-npm run build
-npm pack ./dist/npm/runtime ./dist/npm/adapter ./dist/npm/mcp
-npm install -g ./optimizer-layer-runtime-0.1.0.tgz ./optimizer-layer-agent-adapter-0.1.0.tgz ./optimizer-layer-mcp-0.1.0.tgz
+mkdir optimizer-release && cd optimizer-release
+gh release download --repo Ak1Ena/optimizer-layer --pattern '*.tgz' --pattern SHA256SUMS
+shasum -a 256 -c SHA256SUMS
+npm install -g ./optimizer-layer-*.tgz
 ```
+
+To build from source instead: `npm ci && npm run build`, then `npm pack ./dist/npm/runtime ./dist/npm/adapter ./dist/npm/mcp` and install those tarballs.
+
+Maintainers publish a release by bumping the version in `packages/*/package.json` and pushing a matching tag (`git tag v0.1.0 && git push origin v0.1.0`). The [release workflow](.github/workflows/release.yml) runs tests, typecheck, lint and build, then attaches the tarballs.
 
 The binaries use `#!/usr/bin/env node`. If your default `node` is older than 24.18, run them through a wrapper that calls Node.js 24 explicitly, because older versions lack `node:sqlite`.
 
