@@ -131,18 +131,30 @@ function checkDefinitions(commands: string[], root: string, timeoutMs: number) {
 export function enableProject(projectRoot: string, input: { commands: string[]; timeoutMs: number; yes: boolean }) {
   const root = canonicalRoot(projectRoot);
   let commands = input.commands;
+  let suggestion: string | undefined;
   if (!commands.length) {
     const manifest = join(root, 'package.json');
     const parsed: unknown = existsSync(manifest) ? JSON.parse(readFileSync(manifest, 'utf8')) : null;
     const scripts = typeof parsed === 'object' && parsed !== null && 'scripts' in parsed ? parsed.scripts : null;
     const hasTest = typeof scripts === 'object' && scripts !== null && 'test' in scripts && typeof scripts.test === 'string';
-    if (!hasTest) throw new Error('--check is required');
-    if (!input.yes) throw new Error("No --check given. Proposed: --check 'npm test' (from package.json scripts.test). Re-run with --yes to accept it.");
-    commands = ['npm test'];
+    if (hasTest && input.yes) commands = ['npm test'];
+    else if (hasTest) suggestion = "Re-run with --yes to approve --check 'npm test' (from package.json scripts.test), or let the agent propose a check.";
   }
-  const checks = checkDefinitions(commands, root, input.timeoutMs).map(check => registerArtifacts(root, check));
-  writeProjectConfig(root, { ...loadOrCreate(root), enabled: true, checks, pendingChecks: null });
-  return { projectRoot: root, enabled: true, checks: checks.map(({ id, argv, timeoutMs }) => ({ id, argv, timeoutMs })) };
+  // Validate checks before creating any state, so a rejected command leaves nothing behind.
+  const approved = commands.length ? checkDefinitions(commands, root, input.timeoutMs).map(check => registerArtifacts(root, check)) : null;
+  const config = loadOrCreate(root);
+  // Subfolder sessions resolve to the nearest ancestor with .optimizer/, so an enabled root must have one.
+  runtimeDirectory(root);
+  // Without --check the project is enabled with its current checks; the agent proposes one and the user approves it by code.
+  const checks = approved ?? config.checks;
+  writeProjectConfig(root, { ...config, enabled: true, optedIn: true, checks, pendingChecks: commands.length ? null : config.pendingChecks });
+  return { projectRoot: root, enabled: true, checks: checks.map(({ id, argv, timeoutMs }) => ({ id, argv, timeoutMs })), ...(suggestion ? { suggestion } : {}) };
+}
+
+function runtimeDirectory(root: string): void {
+  const directory = join(root, '.optimizer');
+  if (existsSync(directory) && lstatSync(directory).isSymbolicLink()) throw new Error('Runtime directory must not be a symlink');
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
 }
 
 /** The agent proposes; only a hook-captured user prompt quoting the code activates (see capturePrompt). */
@@ -177,9 +189,7 @@ export function capturePrompt(projectRoot: string, content: string, token: strin
   const config = existing ?? loadOrCreate(root);
   if (!config.enabled) throw new Error('Project is disabled');
   if (existing && !sameSecret(token ?? '', config.hookToken)) throw new Error('prompt requires the hook token');
-  const directory = join(root, '.optimizer');
-  if (existsSync(directory) && lstatSync(directory).isSymbolicLink()) throw new Error('Runtime directory must not be a symlink');
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  runtimeDirectory(root);
   const id = appendCapturedPrompt(root, content, config.hookToken);
   const pending = config.pendingChecks;
   if (pending === null || !approvalCodes(content).includes(pending.code)) return { id, checkApproved: false };

@@ -1,6 +1,6 @@
 # Optimizer MCP
 
-Optional read-only stdio access to one initialized local optimizer project. Requires Node.js 24.18.0 and `@optimizer-layer/runtime` 0.1.0. MCP is not needed to run the optimizer or adapter.
+Optional read-only stdio access to one initialized local optimizer project. Requires Node.js 24.18.0 and `@optimizer-layer/runtime` 0.2.0. MCP is not needed to run the optimizer or adapter.
 
 ```sh
 optimizer-mcp --project /absolute/path/to/project

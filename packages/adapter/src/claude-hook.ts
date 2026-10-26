@@ -258,7 +258,13 @@ function hook(raw: string): Output {
   const root = findRoot(cwd);
   if (!root) return undefined;
   const config = readConfig(root);
-  if (config?.enabled === false) return undefined;
+  // Only an install without a mode marker (always-on behaviour) leaves this unset; any unrecognised marker fails closed to opt-in.
+  const optIn = process.env.OPTIMIZER_MODE !== undefined && process.env.OPTIMIZER_MODE !== 'always-on';
+  if (config?.enabled === false || (optIn && config?.optedIn !== true)) {
+    // A folder the user has not enabled gets only the spawn-free guards, so the agent cannot enable it or forge approvals.
+    const tool = text(input.tool_name);
+    return input.hook_event_name === 'PreToolUse' && tool && isRecord(input.tool_input) ? preToolUse(root, cwd, tool, input.tool_input, false) : undefined;
+  }
   const token = text(config?.hookToken);
   // A project without config gets its token from the runtime at the first capture.
   if (token) process.env.OPTIMIZER_HOOK_TOKEN = token;
@@ -284,7 +290,7 @@ function hook(raw: string): Output {
 /** Matches entries written by any install of this hook, including one whose paths have since moved. */
 function isOurs(hook: unknown): boolean {
   return isRecord(hook) && typeof hook.command === 'string'
-    && (hook.command.includes(script) || /^OPTIMIZER_BIN='.*' '.*\/claude-hook\.[jt]s'(?: ensure --settings '.*')?$/.test(hook.command));
+    && (hook.command.includes(script) || /^(?:OPTIMIZER_MODE='[\w-]+' )?OPTIMIZER_BIN='.*' '.*\/claude-hook\.[jt]s'(?: ensure --settings '.*')?$/.test(hook.command));
 }
 
 function withoutOurs(hooks: unknown): Record<string, unknown> {
@@ -325,6 +331,12 @@ function runtimeExecutable(): string {
   throw new Error('optimizer executable not found on PATH; set OPTIMIZER_BIN to its absolute path');
 }
 
+type Mode = 'opt-in' | 'always-on';
+
+function hookCommand(mode: Mode): string {
+  return `OPTIMIZER_MODE=${quote(mode)} OPTIMIZER_BIN=${quote(runtimeExecutable())} ${quote(process.execPath)} ${quote(script)}`;
+}
+
 function entries(command: string, path: string): [string, Record<string, unknown>][] {
   const entry = (line: string) => ({ hooks: [{ type: 'command', command: line }] });
   return [
@@ -343,14 +355,14 @@ function readSettings(path: string): Record<string, unknown> | null {
   return settings;
 }
 
-function configure(mode: 'install' | 'uninstall', path: string) {
+function configure(mode: 'install' | 'uninstall', path: string, hookMode: Mode) {
   const existing = readSettings(path);
   if (mode === 'uninstall' && !existing) return { settings: path, mode, command: null };
   const settings = existing ?? {};
   const hooks = withoutOurs(settings.hooks);
   let command: string | null = null;
   if (mode === 'install') {
-    command = `OPTIMIZER_BIN=${quote(runtimeExecutable())} ${quote(process.execPath)} ${quote(script)}`;
+    command = hookCommand(hookMode);
     for (const [event, group] of entries(command, path)) {
       const groups = hooks[event];
       hooks[event] = [...(Array.isArray(groups) ? groups : []), group];
@@ -365,26 +377,33 @@ function configure(mode: 'install' | 'uninstall', path: string) {
   const temporary = `${path}.${process.pid}.tmp`;
   writeFileSync(temporary, JSON.stringify(next, null, 2) + '\n');
   renameSync(temporary, path);
-  return { settings: path, mode, command };
+  return { settings: path, mode, ...(command ? { hookMode } : {}), command };
 }
 
-/** SessionStart repair: silent and unchanged when every entry is in place, otherwise a fresh install. */
+/** SessionStart repair: silent and unchanged when every entry is in place, otherwise a fresh install in the installed mode. */
 function ensure(path: string): boolean {
   const settings = readSettings(path);
   const hooks = isRecord(settings?.hooks) ? settings.hooks : {};
-  const expected = entries(`OPTIMIZER_BIN=${quote(runtimeExecutable())} ${quote(process.execPath)} ${quote(script)}`, path);
   const ours = Object.values(hooks).flatMap(groups => Array.isArray(groups) ? groups : [])
     .filter(group => isRecord(group) && Array.isArray(group.hooks) && group.hooks.some(isOurs));
+  const installed = ours.flatMap(group => isRecord(group) && Array.isArray(group.hooks) ? group.hooks.filter(isOurs) : [])
+    .map(hook => String(isRecord(hook) ? hook.command : ''));
+  // An entry without a marker predates install modes and behaved always-on; keep that rather than silently switching.
+  const legacy = installed.length > 0 && installed.every(command => !command.startsWith('OPTIMIZER_MODE='));
+  const alwaysOn = installed.length > 0 && installed.every(command => command.startsWith("OPTIMIZER_MODE='always-on' "));
+  // Unmarked entries predate install modes and behaved always-on; any other or unknown marker repairs as opt-in.
+  const mode: Mode = legacy || alwaysOn ? 'always-on' : 'opt-in';
+  const expected = entries(hookCommand(mode), path);
   const intact = ours.length === expected.length && expected.every(([event, group]) => {
     const groups = hooks[event];
     return Array.isArray(groups) && groups.some(item => JSON.stringify(item) === JSON.stringify(group));
   });
   if (intact) return false;
-  configure('install', path);
+  configure('install', path, mode);
   return true;
 }
 
-const parsed = parseArgs({ allowPositionals: true, options: { settings: { type: 'string' } } });
+const parsed = parseArgs({ allowPositionals: true, options: { settings: { type: 'string' }, 'always-on': { type: 'boolean' } } });
 const [mode, ...extra] = parsed.positionals;
 const settingsPath = resolve(parsed.values.settings ?? join(homedir(), '.claude', 'settings.json'));
 if (mode === 'ensure') {
@@ -397,13 +416,14 @@ if (mode === 'ensure') {
 } else if (mode === 'install' || mode === 'uninstall') {
   try {
     if (extra.length) throw new Error('Unexpected positional arguments');
-    process.stdout.write(JSON.stringify(configure(mode, settingsPath)) + '\n');
+    if (parsed.values['always-on'] && mode !== 'install') throw new Error('--always-on applies only to install');
+    process.stdout.write(JSON.stringify(configure(mode, settingsPath, parsed.values['always-on'] ? 'always-on' : 'opt-in')) + '\n');
   } catch (error) {
     process.stderr.write(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }) + '\n');
     process.exitCode = 1;
   }
 } else if (mode !== undefined) {
-  process.stderr.write('Usage: optimizer-claude-hook [install|uninstall|ensure] [--settings PATH]; without a command it handles one Claude Code hook event on stdin.\n');
+  process.stderr.write('Usage: optimizer-claude-hook install [--always-on] [--settings PATH] | uninstall [--settings PATH] | ensure [--settings PATH]; without a command it handles one Claude Code hook event on stdin.\n');
   process.exitCode = 1;
 } else {
   // Never break Claude Code on hook infrastructure errors: fail open with a one-line diagnostic.

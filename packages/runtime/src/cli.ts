@@ -12,9 +12,11 @@ Commands:
   init
   propose-check --check CMD [--check CMD ...] [--timeout-ms N]
               (pending until the user replies "approve check CODE" in Claude Code)
-  enable      --check CMD [--check CMD ...] [--timeout-ms N]
-              [--yes accepts the package.json test script when --check is omitted]
-  disable     (per-project opt-out of the always-on hooks)
+  enable      [--check CMD ...] [--timeout-ms N]
+              (turns the opt-in hooks on for this project; without --check the
+              existing checks are kept and the agent can propose one;
+              --yes accepts the package.json test script when --check is omitted)
+  disable     (per-project opt-out of the hooks)
   prompt      --file PROMPT.txt (hook capture; requires OPTIMIZER_HOOK_TOKEN)
   current
   start       --request GOAL.md [--checks CHECKS.json, only without approved project checks] [--replace]

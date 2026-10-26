@@ -6,6 +6,15 @@ Date: 2026-10-26. Status: approved by user. Amends [Claude Code hook integration
 
 Work like headroom: install once, then the optimizer is present in every Claude Code session without per-project setup. A local dashboard shows what it is doing.
 
+## Install modes
+
+Amended later on 2026-10-26: public installs are opt-in by default, and always-on is an explicit choice. Everything below describes always-on mode unless it says otherwise.
+
+- `optimizer-claude-hook install` installs opt-in hooks; `install --always-on` installs always-on hooks. The mode is pinned in the hook command as `OPTIMIZER_MODE='opt-in'` or `'always-on'`, so the hook needs no extra file. Re-running `install` without `--always-on` switches back to opt-in.
+- Opt-in: a folder is handled only when its per-user record carries `optedIn: true`, which only the user's `optimizer enable --project P` sets (a record created by always-on capture does not count). Elsewhere `UserPromptSubmit`, `PreToolUse`, `Stop` and `SubagentStart` are silent and create nothing (no `.optimizer/`, no capture, no record, no registry entry, no git exclude) and never spawn the runtime; only the spawn-free `PreToolUse` guards (Bash guard, per-user store and `.optimizer/` edits) still apply, so the agent cannot enable a folder itself.
+- `enable` works without `--check` and without a `package.json` test script: it turns the project on with its current checks (none at first) and creates `.optimizer/` so subfolder sessions resolve to it; the agent then uses `propose-check` and the user approves by code. `enable --check` and `--yes` behave as before.
+- `ensure` reinstalls in the mode the existing entries record. An existing entry without a marker predates modes and behaved always-on, so it is repaired as always-on; with no entries at all `ensure` installs opt-in.
+
 ## User decisions
 
 1. **Always on, every project.** No `optimizer enable` step is required. `optimizer disable --project P` remains as a per-project opt-out; `OPTIMIZER_DISABLED=1` in the environment turns all hooks into no-ops.

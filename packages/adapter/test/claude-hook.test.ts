@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, symlinkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +14,7 @@ const home = realpathSync(mkdtempSync(join(tmpdir(), 'optimizer-hook-home-')));
 process.env.HOME = home;
 process.env.XDG_CONFIG_HOME = join(home, 'config');
 delete process.env.OPTIMIZER_DISABLED;
+delete process.env.OPTIMIZER_MODE;
 test.after(() => rmSync(home, { recursive: true, force: true }));
 
 function setup(t: test.TestContext) {
@@ -62,6 +64,56 @@ test('OPTIMIZER_DISABLED and per-project opt-out make every hook silent', t => {
   optimizer('disable');
   for (const event of events(project)) assert.deepEqual(hook(event), { output: undefined, stderr: '' });
   assert.equal(existsSync(join(project, '.optimizer', 'prompts.jsonl')), false);
+  const enableAttempt = hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'optimizer enable --project .' } }).output;
+  assert.equal(field(enableAttempt, 'hookSpecificOutput', 'permissionDecision'), 'deny', 'the agent cannot re-enable an opted-out project');
+});
+
+test('an unrecognised install mode marker fails closed to opt-in', t => {
+  const { project, hook } = setup(t);
+  for (const event of events(project)) assert.equal(hook(event, project, { OPTIMIZER_MODE: 'opt_in' }).output, undefined);
+  assert.equal(existsSync(join(project, '.optimizer')), false, 'a typo in the marker must not capture everywhere');
+});
+
+test('opt-in mode leaves a folder the user has not enabled untouched, then runs end to end once enabled', t => {
+  const { project, checker, optimizer, hook } = setup(t);
+  mkdirSync(join(project, '.git', 'info'), { recursive: true });
+  const optIn = { OPTIMIZER_MODE: 'opt-in' };
+  const unspawnable = { ...optIn, OPTIMIZER_BIN: '/optimizer-does-not-exist' };
+  const record = join(home, 'config', 'optimizer-layer', 'projects', `${createHash('sha256').update(project).digest('hex')}.json`);
+  const registry = join(home, 'config', 'optimizer-layer', 'projects.json');
+  const untouched = () => {
+    assert.equal(existsSync(join(project, '.optimizer')), false);
+    assert.equal(existsSync(record), false);
+    assert.equal(existsSync(join(project, '.git', 'info', 'exclude')), false);
+    assert.doesNotMatch(existsSync(registry) ? readFileSync(registry, 'utf8') : '', new RegExp(project));
+  };
+  for (const event of [...events(project), { hook_event_name: 'SubagentStart', agent_id: 'a0', agent_type: 'Explore' }, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'npm test' } }]) {
+    assert.deepEqual(hook(event, project, unspawnable), { output: undefined, stderr: '' }, String(event.hook_event_name));
+  }
+  untouched();
+  const bash = (command: string) => hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command } }, project, unspawnable).output;
+  assert.equal(field(bash('optimizer enable --project .'), 'hookSpecificOutput', 'permissionDecision'), 'deny', 'the agent cannot enable a folder itself');
+  untouched();
+
+  optimizer('enable');
+  const context = (cwd = project) => String(field(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'hi' }, cwd, optIn).output, 'hookSpecificOutput', 'additionalContext'));
+  assert.match(context(), /prompt:[0-9a-f-]{36}[\s\S]*no approved check commands yet/);
+  mkdirSync(join(project, 'src'));
+  assert.match(context(join(project, 'src')), new RegExp(`Project ${project} has`), 'a subfolder session uses the enabled root');
+  const code = String(field(optimizer('propose-check', '--check', `node ${checker}`), 'code'));
+  const approved = String(field(hook({ hook_event_name: 'UserPromptSubmit', prompt: `approve check ${code}` }, project, optIn).output, 'hookSpecificOutput', 'additionalContext'));
+  assert.match(approved, /user approved the proposed check commands[\s\S]*Approved project checks:/);
+  writeFileSync(join(project, 'goal.md'), '- R1: greeting works.\nAcceptance R1: greeting returns hello.\n');
+  optimizer('start', '--request', join(project, 'goal.md'));
+  assert.equal(field(hook(edit(join(project, 'greeting.mjs')), project, optIn).output, 'hookSpecificOutput', 'permissionDecision'), 'deny');
+  assert.match(String(field(hook({ hook_event_name: 'SubagentStart', agent_id: 'a1', agent_type: 'Explore' }, project, optIn).output, 'hookSpecificOutput', 'additionalContext')), /active optimizer session/);
+  assert.equal(field(hook({ hook_event_name: 'Stop' }, project, optIn).output, 'decision'), 'block');
+});
+
+test('opt-in mode ignores a record that always-on hooks created on first use', t => {
+  const { project, hook } = setup(t);
+  hook({ hook_event_name: 'UserPromptSubmit', prompt: 'hi' });
+  assert.equal(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'hi' }, project, { OPTIMIZER_MODE: 'opt-in' }).output, undefined);
 });
 
 test('without an active session PreToolUse and Stop stay silent and never spawn the runtime', t => {
@@ -253,24 +305,29 @@ test('installer merges idempotently, keeps unrelated settings and uninstalls onl
     },
   };
   writeFileSync(settings, JSON.stringify(original));
-  const install = () => {
-    const result = spawnSync(process.execPath, [hookScript, 'install', '--settings', settings], { encoding: 'utf8', env: { ...process.env, OPTIMIZER_BIN: bin } });
+  const install = (...flags: string[]) => {
+    const result = spawnSync(process.execPath, [hookScript, 'install', ...flags, '--settings', settings], { encoding: 'utf8', env: { ...process.env, OPTIMIZER_BIN: bin } });
     assert.equal(result.status, 0, result.stderr);
     return JSON.parse(readFileSync(settings, 'utf8')) as unknown;
   };
-  const command = `OPTIMIZER_BIN='${bin}' '${process.execPath}' '${hookScript}'`;
-  const ours = { hooks: [{ type: 'command', command }] };
-  const expected = {
-    model: 'opus',
-    hooks: {
-      PreToolUse: [original.hooks.PreToolUse[0], { matcher: 'Edit|Write|MultiEdit|NotebookEdit|Bash', ...ours }],
-      SessionStart: [...original.hooks.SessionStart, { matcher: 'startup|resume', hooks: [{ type: 'command', command: `${command} ensure --settings '${settings}'` }] }],
-      UserPromptSubmit: [ours],
-      Stop: [ours],
-      SubagentStart: [ours],
-    },
+  const entriesFor = (command: string) => {
+    const ours = { hooks: [{ type: 'command', command }] };
+    return {
+      model: 'opus',
+      hooks: {
+        PreToolUse: [original.hooks.PreToolUse[0], { matcher: 'Edit|Write|MultiEdit|NotebookEdit|Bash', ...ours }],
+        SessionStart: [...original.hooks.SessionStart, { matcher: 'startup|resume', hooks: [{ type: 'command', command: `${command} ensure --settings '${settings}'` }] }],
+        UserPromptSubmit: [ours],
+        Stop: [ours],
+        SubagentStart: [ours],
+      },
+    };
   };
-  assert.deepEqual(install(), expected);
+  const preMode = `OPTIMIZER_BIN='${bin}' '${process.execPath}' '${hookScript}'`;
+  const expected = entriesFor(`OPTIMIZER_MODE='opt-in' ${preMode}`);
+  const alwaysOn = entriesFor(`OPTIMIZER_MODE='always-on' ${preMode}`);
+  assert.deepEqual(install('--always-on'), alwaysOn);
+  assert.deepEqual(install(), expected, 'install without --always-on switches back to opt-in');
   assert.deepEqual(install(), expected);
   const ensure = () => {
     const result = spawnSync(process.execPath, [hookScript, 'ensure', '--settings', settings], { encoding: 'utf8', input: '{"hook_event_name":"SessionStart"}', env: { ...process.env, OPTIMIZER_BIN: bin } });
@@ -292,6 +349,20 @@ test('installer merges idempotently, keeps unrelated settings and uninstalls onl
   writeFileSync(settings, JSON.stringify(moved));
   assert.match(ensure(), /repaired/);
   assert.deepEqual(JSON.parse(readFileSync(settings, 'utf8')), expected, 'entries pointing to a moved path are replaced, not duplicated');
+  writeFileSync(settings, JSON.stringify({ ...alwaysOn, hooks: { ...alwaysOn.hooks, Stop: [] } }));
+  assert.match(ensure(), /repaired/);
+  assert.deepEqual(JSON.parse(readFileSync(settings, 'utf8')), alwaysOn, 'repair keeps an always-on install always-on');
+  writeFileSync(settings, JSON.stringify(alwaysOn).replaceAll(`OPTIMIZER_MODE='always-on' `, `OPTIMIZER_MODE='opt_in' `));
+  assert.match(ensure(), /repaired/);
+  assert.deepEqual(JSON.parse(readFileSync(settings, 'utf8')), expected, 'an unknown marker repairs as opt-in');
+  writeFileSync(settings, installed.replaceAll(`OPTIMIZER_MODE='opt-in' `, ''));
+  assert.match(ensure(), /repaired/);
+  assert.deepEqual(JSON.parse(readFileSync(settings, 'utf8')), alwaysOn, 'an install from before modes existed behaved always-on and stays so');
+  const fresh = join(directory, 'fresh', 'settings.json');
+  const created = spawnSync(process.execPath, [hookScript, 'ensure', '--settings', fresh], { encoding: 'utf8', env: { ...process.env, OPTIMIZER_BIN: bin } });
+  assert.equal(created.status, 0, created.stderr);
+  assert.match(readFileSync(fresh, 'utf8'), /"command": "OPTIMIZER_MODE='opt-in' OPTIMIZER_BIN=/, 'a fresh install defaults to opt-in');
+  writeFileSync(settings, installed);
   assert.deepEqual(JSON.parse(readFileSync(`${settings}.optimizer-backup`, 'utf8')), original);
   const uninstalled = spawnSync(process.execPath, [hookScript, 'uninstall', '--settings', settings], { encoding: 'utf8' });
   assert.equal(uninstalled.status, 0, uninstalled.stderr);

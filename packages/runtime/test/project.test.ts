@@ -37,9 +37,15 @@ function token(project: string): string {
 
 test('enable tokenizes checks without a shell, resolves argv[0] and requires --yes for a proposed test script', (t) => {
   const { project, checker } = setup(t);
-  assert.throws(() => enableProject(project, { commands: [], timeoutMs: 1000, yes: false }), /--check is required/);
+  assert.throws(() => enableProject(project, { commands: ['node a; rm -rf /'], timeoutMs: 1000, yes: false }), /metacharacters/);
+  assert.equal(readProjectConfig(project), null, 'a rejected check leaves no record');
+  assert.equal(existsSync(join(project, '.optimizer')), false, 'a rejected check leaves no runtime directory');
+  assert.deepEqual(enableProject(project, { commands: [], timeoutMs: 1000, yes: false }), { projectRoot: project, enabled: true, checks: [] }, 'opt-in enable needs no check');
+  assert.equal(readProjectConfig(project)?.optedIn, true);
+  assert.ok(statSync(join(project, '.optimizer')).isDirectory(), 'subfolder sessions resolve to the enabled root');
   writeFileSync(join(project, 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }));
-  assert.throws(() => enableProject(project, { commands: [], timeoutMs: 1000, yes: false }), /--check 'npm test'.*--yes/);
+  assert.match(String(enableProject(project, { commands: [], timeoutMs: 1000, yes: false }).suggestion), /--yes to approve --check 'npm test'/);
+  assert.deepEqual(readProjectConfig(project)?.checks, []);
   for (const command of ['node a.mjs | tee x', 'node a; rm -rf /', 'echo $HOME', 'node a > out', 'echo `id`', 'a && b']) {
     assert.throws(() => commandArgv(command, project), /metacharacters/);
   }

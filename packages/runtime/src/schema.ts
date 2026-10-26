@@ -75,6 +75,8 @@ const projectConfig = z.object({
   projectRoot: z.string().min(1).max(4096), enabled: z.boolean(), hookToken: z.string().regex(/^[0-9a-f]{64}$/), checks: z.array(checkSchema).max(100), activeSessionId: id.nullable(),
   // Proposed by the agent; activated only by a hook-captured user prompt quoting the code.
   pendingChecks: z.object({ code: z.string().regex(/^[0-9a-f]{4}$/), checks: z.array(checkDefinition).min(1).max(100) }).strict().nullable().default(null),
+  // Set only by the user's `optimizer enable`; opt-in hooks ignore records that always-on hooks created on first use.
+  optedIn: z.literal(true).optional(),
 }).strict();
 export type ProjectConfig = z.infer<typeof projectConfig>;
 

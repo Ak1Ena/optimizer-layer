@@ -23,7 +23,7 @@ npm install -g ./optimizer-layer-*.tgz
 
 To build from source instead: `npm ci && npm run build`, then `npm pack ./dist/npm/runtime ./dist/npm/adapter ./dist/npm/mcp` and install those tarballs.
 
-Maintainers publish a release by bumping the version in `packages/*/package.json` and pushing a matching tag (`git tag v0.1.0 && git push origin v0.1.0`). The [release workflow](.github/workflows/release.yml) runs tests, typecheck, lint and build, then attaches the tarballs.
+Maintainers publish a release by bumping the version in `packages/*/package.json` and pushing a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The [release workflow](.github/workflows/release.yml) runs tests, typecheck, lint and build, then attaches the tarballs.
 
 The binaries use `#!/usr/bin/env node`. If your default `node` is older than 24.18, run them through a wrapper that calls Node.js 24 explicitly, because older versions lack `node:sqlite`.
 
@@ -33,11 +33,20 @@ The binaries use `#!/usr/bin/env node`. If your default `node` is older than 24.
 optimizer-claude-hook install
 ```
 
-This merges hook entries into `~/.claude/settings.json`, writing `settings.json.optimizer-backup` first and keeping your other settings and hooks. A `SessionStart` entry runs `optimizer-claude-hook ensure`, which silently repairs the other entries if something removed them. Remove everything with `optimizer-claude-hook uninstall`. Start a new Claude Code session afterwards.
+This merges hook entries into `~/.claude/settings.json`, writing `settings.json.optimizer-backup` first and keeping your other settings and hooks. A `SessionStart` entry runs `optimizer-claude-hook ensure`, which silently repairs the other entries if something removed them, keeping the mode you installed. Remove everything with `optimizer-claude-hook uninstall`. Start a new Claude Code session afterwards.
 
-From then on the optimizer is on in every Claude Code session, in any folder. There is no per-project setup. The first prompt in a folder creates `.optimizer/` there (or uses the nearest parent that already has one) and, inside a git repository, adds `.optimizer/` to `.git/info/exclude` so it never shows up in `git status`.
+**3. Turn it on per project.** The default install is opt-in: the hooks do nothing in a folder until you enable it.
 
-**3. Chat normally.**
+```sh
+cd /path/to/project
+optimizer enable --project .
+```
+
+This creates `.optimizer/` there and, inside a git repository, adds `.optimizer/` to `.git/info/exclude` so it never shows up in `git status`. Sessions in subfolders use the nearest parent with `.optimizer/`. In every other folder the hooks stay silent and create nothing.
+
+To have the optimizer on in every folder without `enable`, install with `optimizer-claude-hook install --always-on` instead. The first prompt in a folder then creates `.optimizer/` there. Running `optimizer-claude-hook install` again switches back to opt-in.
+
+**4. Chat normally.**
 
 ```text
 claude
@@ -52,7 +61,7 @@ Useful commands:
 
 ```sh
 optimizer current --project .   # active task and next step
-optimizer disable --project .   # opt this project out; history is kept
+optimizer disable --project .   # turn this project off; history is kept
 optimizer dashboard             # local read-only web page of all projects
 OPTIMIZER_DISABLED=1 claude     # one session with every optimizer hook off
 ```
@@ -160,7 +169,7 @@ Once a task has started, the Claude Code hooks deny Edit and Write tools during 
 
 Implemented: structured goal extraction, versioned contract review and challenge, bounded lexical context retrieval, provenance-aware decision import, context sufficiency assessment, durable event replay, cooperative reconsideration, and independent registered-command verification.
 
-The shipped integrations are explicit skill/CLI checkpoints, always-on Claude Code hooks, and a local read-only dashboard (below). The runtime can gate its own checks. The hooks deny file-edit tools and block ending a turn according to the runtime's next action; they are tested with real hook JSON on stdin and were exercised once in a live Claude Code 2.1 session on the parseCount fixture (plain-language request, drafted contract, approval, a denied early edit, verified completion). Bash file edits are not intercepted, and Codex hooks are not implemented.
+The shipped integrations are explicit skill/CLI checkpoints, opt-in (or always-on) Claude Code hooks, and a local read-only dashboard (below). The runtime can gate its own checks. The hooks deny file-edit tools and block ending a turn according to the runtime's next action; they are tested with real hook JSON on stdin and were exercised once in a live Claude Code 2.1 session on the parseCount fixture (plain-language request, drafted contract, approval, a denied early edit, verified completion). Bash file edits are not intercepted, and Codex hooks are not implemented.
 
 Broader natural-language interpretation through a replaceable model provider, richer code relationships, native conversation import, and repeated comparative evaluation remain future work. The current goal syntax and limits are documented below.
 
@@ -281,16 +290,19 @@ Install the adapter's [checkpoint skill](packages/adapter/skill/optimizer-checkp
 The adapter's `optimizer-claude-hook` lets you chat in plain language while the runtime keeps the agent on a goal contract. One-time machine setup (writes `settings.json.optimizer-backup` first, idempotent, preserves other settings and hooks):
 
 ```sh
-optimizer-claude-hook install                        # merges into ~/.claude/settings.json
+optimizer-claude-hook install                        # opt-in; merges into ~/.claude/settings.json
+optimizer-claude-hook install --always-on            # every folder, no enable step
 optimizer-claude-hook install --settings /path/settings.json
 optimizer-claude-hook uninstall                      # removes only its own entries
 ```
 
-The installer pins the current Node.js executable and the runtime executable (`OPTIMIZER_BIN`, else `optimizer` on `PATH`) into the hook command. It adds `UserPromptSubmit`, `PreToolUse`, `Stop`, `SubagentStart`, and a `SessionStart` (`startup|resume`) entry running `optimizer-claude-hook ensure`. Subagents follow the same edit gating and Bash guard as the main agent. While a session is active, `SubagentStart` gives each subagent the contract summary and next action. A subagent's instructions come from the main agent, so they never count as user decisions, and subagents are not blocked from stopping; the main agent owns review, resolution and completion. `ensure` prints nothing and changes nothing while every entry is in place; otherwise it reinstalls them, replacing entries that point to a moved path. It never fails the session.
+The installer pins the install mode (`OPTIMIZER_MODE='opt-in'` or `'always-on'`), the current Node.js executable and the runtime executable (`OPTIMIZER_BIN`, else `optimizer` on `PATH`) into the hook command. Re-running `install` replaces the entries, so the last install's mode wins. It adds `UserPromptSubmit`, `PreToolUse`, `Stop`, `SubagentStart`, and a `SessionStart` (`startup|resume`) entry running `optimizer-claude-hook ensure`. Subagents follow the same edit gating and Bash guard as the main agent. While a session is active, `SubagentStart` gives each subagent the contract summary and next action. A subagent's instructions come from the main agent, so they never count as user decisions, and subagents are not blocked from stopping; the main agent owns review, resolution and completion. `ensure` prints nothing and changes nothing while every entry is in place; otherwise it reinstalls them in the mode the existing entries record, replacing entries that point to a moved path. Entries from an install that predates modes carry no marker and behaved always-on, so `ensure` keeps them always-on; with no entries at all it installs opt-in. It never fails the session.
 
-**Always on.** Every folder is a project. The project root is the nearest ancestor of the session's working directory that already has `.optimizer/`, else the working directory itself; never the filesystem root or a path inside `.optimizer/`. Your home directory can be a project, but only when Claude runs in it, so a `~/.optimizer/` never absorbs the projects below it. On the first captured prompt the runtime creates `.optimizer/` (mode 0700, files 0600) for runtime data (`runtime.sqlite`, `prompts.jsonl`, drafts, loop-guard state), creates the project's per-user record `$XDG_CONFIG_HOME/optimizer-layer/projects/<sha256 of the root>.json` (default under `~/.config`, mode 0600) holding the hook token, approved checks, pending proposal, opt-out flag and active session, lists the project in `optimizer-layer/projects.json` for the dashboard, and, inside a git work tree, adds `.optimizer/` once to `.git/info/exclude`. Tracked `.gitignore` files are never edited. Opt out per project with `optimizer disable --project .` (history is kept; `enable` turns it back on), or for a whole session with `OPTIMIZER_DISABLED=1`.
+**Opt-in (default).** A folder is handled only when its per-user record says you enabled it with `optimizer enable --project P` (with or without `--check`). Elsewhere every hook event is silent: no `.optimizer/`, no prompt capture, no per-user record, no registry entry, no git exclude, and the runtime is not started. The only exception is the spawn-free `PreToolUse` guard described below, so the agent cannot enable a folder or write approvals itself. A per-user record created by always-on hooks does not count as enabling. `enable` without `--check` keeps the project's current checks (none at first) and creates `.optimizer/`; the agent then proposes a check and you approve it by code. With a `package.json` test script, `enable --yes` approves `npm test` directly.
 
-**Check approval.** A project needs approved check commands before a task can start; `start` without them fails and names `propose-check`. The agent runs `optimizer propose-check --project P --check CMD [--check CMD ...] [--timeout-ms N]`, which stores a pending proposal with a random four-hex-digit code and replaces any earlier one. While a proposal is pending, every prompt shows the agent the exact argv and the phrase `approve check CODE`. When your own prompt contains that phrase with the matching code (case-insensitive, whole words), the runtime makes those checks the project checks (replacing old ones, verifier artifacts pinned) and clears the proposal. Nothing else activates a proposal. `optimizer enable --project . --check 'npm test' [--check ...] [--timeout-ms 30000]` sets checks directly if you prefer the CLI; without `--check`, a `package.json` test script is proposed and needs `--yes`. Check commands are split into argv without a shell; the shell metacharacters ``| ; & $ > < ` `` are rejected, and the executable is resolved to an absolute path. Each project check covers every requirement of every task.
+**Always on (`--always-on`).** Every folder is a project. The project root is the nearest ancestor of the session's working directory that already has `.optimizer/`, else the working directory itself; never the filesystem root or a path inside `.optimizer/`. Your home directory can be a project, but only when Claude runs in it, so a `~/.optimizer/` never absorbs the projects below it. On the first captured prompt the runtime creates `.optimizer/` (mode 0700, files 0600) for runtime data (`runtime.sqlite`, `prompts.jsonl`, drafts, loop-guard state), creates the project's per-user record `$XDG_CONFIG_HOME/optimizer-layer/projects/<sha256 of the root>.json` (default under `~/.config`, mode 0600) holding the hook token, approved checks, pending proposal, opt-out flag and active session, lists the project in `optimizer-layer/projects.json` for the dashboard, and, inside a git work tree, adds `.optimizer/` once to `.git/info/exclude`. Tracked `.gitignore` files are never edited. Turn a project off with `optimizer disable --project .` in either mode (history is kept; `enable` turns it back on), or every project for a whole session with `OPTIMIZER_DISABLED=1`.
+
+**Check approval.** A project needs approved check commands before a task can start; `start` without them fails and names `propose-check`. The agent runs `optimizer propose-check --project P --check CMD [--check CMD ...] [--timeout-ms N]`, which stores a pending proposal with a random four-hex-digit code and replaces any earlier one. While a proposal is pending, every prompt shows the agent the exact argv and the phrase `approve check CODE`. When your own prompt contains that phrase with the matching code (case-insensitive, whole words), the runtime makes those checks the project checks (replacing old ones, verifier artifacts pinned) and clears the proposal. Nothing else activates a proposal. `optimizer enable --project . --check 'npm test' [--check ...] [--timeout-ms 30000]` sets checks directly if you prefer the CLI; without `--check` it keeps the current checks, and `--yes` accepts a `package.json` test script as `npm test`. Check commands are split into argv without a shell; the shell metacharacters ``| ; & $ > < ` `` are rejected, and the executable is resolved to an absolute path. Each project check covers every requirement of every task.
 
 **On each prompt** the hook captures your message into `.optimizer/prompts.jsonl` and injects the current state. With no open contract it says so, and that a code-change request should get a drafted contract under `.optimizer/drafts/`, shown to you, and `optimizer start --project P --request DRAFT` after you approve (`--replace` supersedes an unfinished session). Nothing is blocked until a task starts. With an active task, edit tools are denied while the action is clarify, review, retrieve, reconsider, or escalate, and Stop is blocked while the task is unverified, at most three consecutive times and never twice for unchanged state. Without an active session, `PreToolUse` and `Stop` read only the project's per-user record and do not start the runtime. A session that reaches verified `complete` releases the active-session pointer. The hooks never write runtime state through a symlink planted in `.optimizer/`.
 
