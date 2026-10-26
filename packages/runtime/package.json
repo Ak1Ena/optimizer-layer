@@ -1,6 +1,6 @@
 {
   "name": "@optimizer-layer/runtime",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Local cooperative goal-driven optimizer runtime",
   "type": "module",
   "engines": {

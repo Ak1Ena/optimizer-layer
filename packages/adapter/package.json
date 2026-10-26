@@ -1,6 +1,6 @@
 {
   "name": "@optimizer-layer/agent-adapter",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Thin cooperative coding-agent checkpoint transport and installable skill",
   "type": "module",
   "engines": {

@@ -8,27 +8,33 @@ import { parseArgs } from 'node:util';
 import { runOptimizer, type OptimizerCommand } from './index.ts';
 
 type Output = Record<string, unknown> | undefined;
-type Action = { kind: string; reason: string; uncertaintyIds?: unknown };
-interface Current { sessionId: string | null; action: Action | null; summary: string; checks: string[][]; pending: { code: string; argv: string[][] } | null }
+interface Current { sessionId: string | null; checkpoint: Decision | null; summary: string; checks: string[][]; pending: { code: string; argv: string[][] } | null }
+interface Decision { decision: string; reason: string; phase: string; requiredBy: string; uncertaintyIds: unknown }
 
 const script = fileURLToPath(import.meta.url);
-const editMatcher = 'Edit|Write|MultiEdit|NotebookEdit|Bash';
-const blockingActions = new Set(['clarify', 'review', 'retrieve', 'reconsider', 'escalate']);
+// Only these tools reach the hook, so reads cost no runtime spawn; other tools (MCP, web) are not gated.
+const gatedTools = ['Edit', 'Write', 'MultiEdit', 'NotebookEdit', 'Bash'];
+const editMatcher = gatedTools.join('|');
+// Claude Code kills a hook after this many seconds and then proceeds; each runtime call stays well below it.
+const hookTimeoutSeconds = 60;
+const callTimeoutMs = 15_000;
 const dialect = `Goal dialect (one item per line):
 - R1: requested behavior in the user's words.
 Acceptance R1: observable passing result.
 Question human Q1: a consequential choice that belongs to the user?
 Question local Q2: a technical fact to investigate?
 Do not invent acceptance criteria or human choices; ask the user instead.`;
+/** How to satisfy each runtime controller decision. */
 const instructions: Record<string, string> = {
-  retrieve: 'Run `optimizer retrieve`, inspect items and diagnostics, then `optimizer assess --kind sufficient|insufficient --rationale TEXT --items ID,ID` citing current item IDs. Resolve local questions with `optimizer resolve --question ID --source ITEM_ID --answer TEXT`.',
-  clarify: 'Ask the user the open human questions and wait for the answer. When a captured user prompt answers one, run `optimizer resolve --question ID --source prompt:PROMPT_ID`. Never invent a human answer.',
-  review: 'Read `optimizer status`, then accept with `optimizer review --kind accept --version VERSION --rationale TEXT --items ID,ID` citing context for every requirement, or challenge with `--kind challenge --requirement R --owner local|human`.',
-  execute: 'Implement the contract with normal tools. Run `optimizer check --check CHECK_ID` and follow the returned action; when done run `optimizer claim` and `optimizer verify`.',
-  verify: 'Run `optimizer verify`. If edits made the context stale, retrieve and assess again first.',
-  reconsider: 'Stop editing. Read the failed evidence with `optimizer status` and answer `optimizer reconsider --strategy retain|revise --rationale TEXT`.',
-  escalate: 'Stop dependent work and show the user the reason and evidence.',
-  complete: 'Report the verified requirement IDs and evidence.',
+  RETRIEVE_CONTEXT: 'Run `optimizer retrieve`, inspect items and diagnostics, then `optimizer assess --kind sufficient|insufficient --rationale TEXT --items ID,ID` citing current item IDs. Resolve local questions with `optimizer resolve --question ID --source ITEM_ID --answer TEXT`.',
+  INVESTIGATE: 'Run `optimizer retrieve` again, inspect the stale or missing items, then `optimizer assess` citing current item IDs. Resolve local questions with `optimizer resolve --question ID --source ITEM_ID --answer TEXT`.',
+  ASK_HUMAN: 'Ask the user the open human questions (or show the escalation reason and evidence) and wait for the answer. When a captured user prompt answers one, run `optimizer resolve --question ID --source prompt:PROMPT_ID`. Never invent a human answer.',
+  REVIEW_CONTRACT: 'Read `optimizer status`, then accept with `optimizer review --kind accept --version VERSION --rationale TEXT --items ID,ID` citing context for every requirement, or challenge with `--kind challenge --requirement R --owner local|human`.',
+  PROCEED: 'Implement the contract with normal tools. Run `optimizer check --check CHECK_ID` and follow the returned action; when done run `optimizer claim` and `optimizer verify`.',
+  RUN_VERIFICATION: 'Run `optimizer verify`; the task is complete only when its outcome is VERIFIED. If edits made the context stale, retrieve and assess again first.',
+  REQUEST_RECONSIDERATION: 'Stop editing. Read the failed evidence with `optimizer status` and answer `optimizer reconsider --strategy retain|revise --rationale TEXT`.',
+  BLOCK_ACTION: 'Report the blocker to the user, or resume through an optimizer checkpoint command.',
+  COMPLETE: 'Report the verified requirement IDs and evidence.',
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -60,12 +66,17 @@ function findRoot(cwd: string): string | null {
   const inside = parts.indexOf('.optimizer');
   const start = inside === -1 ? resolve(cwd) : parts.slice(0, inside).join(sep) || sep;
   const home = resolve(homedir());
+  let nearest: string | null = null;
   for (let directory = start; dirname(directory) !== directory; directory = dirname(directory)) {
     // A home-directory project applies only in home itself; otherwise it would absorb every project below it.
     if (directory === home && directory !== start) break;
-    if (existsSync(join(directory, '.optimizer'))) return realpathSync.native(directory);
+    if (!existsSync(join(directory, '.optimizer'))) continue;
+    const root = realpathSync.native(directory);
+    // An enabled per-user record wins over a nearer bare .optimizer, which anyone (the agent included) can create to escape the gate.
+    if (readConfig(root)?.enabled === true) return root;
+    nearest ??= root;
   }
-  return dirname(start) === start ? null : realpathSync.native(start);
+  return nearest ?? (dirname(start) === start ? null : realpathSync.native(start));
 }
 
 /** Mirrors the runtime's per-user store; a project.json inside the project is never trusted. */
@@ -88,41 +99,60 @@ function argvList(value: unknown): string[][] {
   return Array.isArray(value) ? value.filter(item => Array.isArray(item)).map(item => item.map(String)) : [];
 }
 
-function call(root: string, command: OptimizerCommand, options: Record<string, string> = {}): Record<string, unknown> {
+function call(root: string, command: OptimizerCommand, options: Record<string, string> = {}, sessionId?: string): Record<string, unknown> {
   const executable = process.env.OPTIMIZER_BIN;
   if (!executable) throw new Error('OPTIMIZER_BIN is not set; re-run optimizer-claude-hook install');
-  const result = runOptimizer({ executable, projectRoot: root, command, options, timeoutMs: 20_000 });
+  const result = runOptimizer({ executable, projectRoot: root, command, options, timeoutMs: callTimeoutMs, ...(sessionId === undefined ? {} : { sessionId }) });
   if (result.kind !== 'response' || result.exitCode !== 0 || !isRecord(result.value)) {
-    throw new Error(`optimizer ${command} failed: ${result.kind === 'response' ? JSON.stringify(result.value) : result.stderr.trim() || result.kind}`);
+    throw new Error(`optimizer ${command} failed: ${result.kind === 'response' ? JSON.stringify(result.value) : result.stderr.trim() || ('reason' in result ? result.reason : result.kind)}`);
   }
   return result.value;
 }
 
+/** Passes hook input to the runtime through a private temporary file, never through argv. */
+function withFile<T>(content: string, use: (file: string) => T): T {
+  const directory = mkdtempSync(join(tmpdir(), 'optimizer-hook-'));
+  try {
+    const file = join(directory, 'input');
+    writeFileSync(file, content, { mode: 0o600 });
+    return use(file);
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 function current(root: string): Current {
   const value = call(root, 'current');
-  const action = value.action;
   const pending = value.pendingChecks;
   return {
     sessionId: text(value.sessionId) ?? null,
-    action: isRecord(action) && typeof action.kind === 'string' && typeof action.reason === 'string' ? { kind: action.kind, reason: action.reason, uncertaintyIds: action.uncertaintyIds } : null,
+    // `current` carries the structured decision, saving a second runtime spawn per prompt or Stop.
+    checkpoint: isRecord(value.checkpoint) ? decision(value.checkpoint) : null,
     summary: text(value.summary) ?? '',
     checks: argvList(value.checks),
     pending: isRecord(pending) && typeof pending.code === 'string' ? { code: pending.code, argv: argvList(pending.argv) } : null,
   };
 }
 
-function capture(root: string, prompt: string): { id: string; checkApproved: boolean; approvalError: string | undefined } {
-  const directory = mkdtempSync(join(tmpdir(), 'optimizer-prompt-'));
-  try {
-    const file = join(directory, 'prompt.txt');
-    writeFileSync(file, prompt, { mode: 0o600 });
+function decision(value: Record<string, unknown>): Decision | null {
+  const kind = text(value.decision);
+  if (!kind) return null;
+  const action = isRecord(value.action) ? value.action : {};
+  return { decision: kind, reason: text(value.reason) ?? '', phase: text(value.phase) ?? 'unknown', requiredBy: text(value.requiredBy) ?? 'agent', uncertaintyIds: action.uncertaintyIds };
+}
+
+function capture(root: string, prompt: string): { id: string; checkApproved: boolean; changeApproved: string | undefined; approvalError: string | undefined } {
+  return withFile(prompt, file => {
     const value = call(root, 'prompt', { file });
     const id = text(value.id);
     if (!id) throw new Error('optimizer prompt returned no ID');
-    return { id, checkApproved: value.checkApproved === true, approvalError: text(value.approvalError) };
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
+    return { id, checkApproved: value.checkApproved === true, changeApproved: text(value.changeApproved), approvalError: text(value.approvalError) };
+  });
+}
+
+function outside(root: string, path: string): boolean {
+  const child = relative(root, path);
+  return child === '..' || child.startsWith(`..${sep}`) || isAbsolute(child);
 }
 
 function userPromptSubmit(root: string, prompt: string): Output {
@@ -133,6 +163,7 @@ function userPromptSubmit(root: string, prompt: string): Output {
     id = captured.id;
     lines.push(`optimizer: this user prompt was captured as prompt:${id}; it can be cited as a human decision source with --source prompt:${id}.`);
     if (captured.checkApproved) lines.push('optimizer: with this prompt the user approved the proposed check commands; they are now the project checks.');
+    if (captured.changeApproved) lines.push(`optimizer: with this prompt the user approved \`optimizer ${captured.changeApproved}\`; it is now applied.`);
     if (captured.approvalError) lines.push(`optimizer: the user typed the approval code, but the proposed checks could not be activated: ${captured.approvalError}. Propose a corrected check.`);
   } catch (error) {
     process.stderr.write(`optimizer-claude-hook: ${error instanceof Error ? error.message : String(error)}\n`.replaceAll(/\n(?!$)/g, ' '));
@@ -143,23 +174,30 @@ function userPromptSubmit(root: string, prompt: string): Output {
   if (state.pending) {
     lines.push(`Pending check proposal (argv, run without a shell):\n${commands(state.pending.argv)}\nThe user approves it by replying with \`approve check ${state.pending.code}\`; nothing else activates it.`);
   }
-  if (!state.sessionId || !state.action || state.action.kind === 'complete') {
-    lines.push(
-      `Project ${root} has no open optimizer goal contract; file edits are not gated.`,
-      `A request that changes files should get a contract first: draft it under ${root}/.optimizer/drafts/NAME.md in the dialect below, show the draft to the user with any open human questions, and only after the user explicitly approves run \`optimizer start --project ${root} --request ${root}/.optimizer/drafts/NAME.md\` (the user-approved project checks apply automatically).`,
-      state.checks.length
-        ? `Approved project checks:\n${commands(state.checks)}`
-        : `The project has no approved check commands yet, and start needs them. Propose the project's test command with \`optimizer propose-check --project ${root} --check CMD\` and show the user the returned argv and approval phrase.`,
+  const checkpoint = state.sessionId ? state.checkpoint : null;
+  if (!state.sessionId || !checkpoint || checkpoint.decision === 'COMPLETE') {
+    // A managed project's contract comes from the controller; offering an agent-drafted alternative made agents stall for approval.
+    lines.push(...(state.checks.length
+      ? [
+          `Project ${root} is managed by the optimizer and has no open goal contract. Work on the request normally: the first file edit or non-read-only Bash command starts a contract from this prompt automatically (R1 = the prompt verbatim, accepted when every approved project check passes), and the denial names the checkpoint to complete. To add requirements or flag a contradiction, use the contract review (\`review --kind challenge\`) with evidence. Reads and read-only commands are never blocked.`,
+          `Approved project checks:\n${commands(state.checks)}`,
+        ]
+      : [
+          `Project ${root} has no open optimizer goal contract and is unmanaged: it has no approved check, so file edits are not gated and no task here can be verified.`,
+          `To shape a contract, draft it under ${root}/.optimizer/drafts/NAME.md in the dialect below, show the draft to the user with any open human questions, and only after the user explicitly approves run \`optimizer start --project ${root} --request ${root}/.optimizer/drafts/NAME.md\`.`,
+          `The project has no approved check commands yet, and start needs them. Propose the project's test command with \`optimizer propose-check --project ${root} --check CMD\` and show the user the returned argv and approval phrase.`,
+          dialect,
+        ]),
       'Questions and explanations that change no files need no session.',
-      dialect,
     );
   } else {
     lines.push(
-      `Active optimizer session ${state.sessionId}. Every optimizer command takes --project ${root} --session ${state.sessionId}.`,
+      `Active optimizer session ${state.sessionId}, phase ${checkpoint.phase}. Every optimizer command takes --project ${root} --session ${state.sessionId}.`,
       state.summary,
-      `Checkpoint for ${state.action.kind}: ${instructions[state.action.kind] ?? 'Follow the runtime reason.'}`,
+      `Decision ${checkpoint.decision} (required by ${checkpoint.requiredBy}): ${checkpoint.reason}`,
+      `Checkpoint: ${instructions[checkpoint.decision] ?? 'Follow the runtime reason.'}`,
       `If this prompt answers an open human question, run \`optimizer resolve --project ${root} --session ${state.sessionId} --question ID --source prompt:${id}\`.`,
-      `If the user asks for a different task, draft and get approval for a new contract, then start it with --replace.`,
+      `If the user asks for a different task, work on it: once this session completes, the next change starts a new contract from the new prompt.`,
     );
   }
   return { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: lines.join('\n').slice(0, 8000) } };
@@ -168,11 +206,12 @@ function userPromptSubmit(root: string, prompt: string): Output {
 /** Subagents get the contract so they stay on goal, but never user authority or the duty to finish the task. */
 function subagentStart(root: string): Output {
   const state = current(root);
-  if (!state.sessionId || !state.action || state.action.kind === 'complete') return undefined;
+  const checkpoint = state.sessionId ? state.checkpoint : null;
+  if (!state.sessionId || !checkpoint || checkpoint.decision === 'COMPLETE') return undefined;
   const lines = [
-    `optimizer: this subagent works inside the main agent's active optimizer session ${state.sessionId} for project ${root}.`,
+    `optimizer: this subagent works inside the main agent's active optimizer session ${state.sessionId} for project ${root}, phase ${checkpoint.phase}.`,
     state.summary,
-    `Current next action: ${state.action.kind}. File edits are allowed only while the action is execute or verify; otherwise Edit and Write are denied.`,
+    `Current decision: ${checkpoint.decision}: ${checkpoint.reason}. File edits and non-read-only Bash commands are allowed only while the decision is PROCEED or RUN_VERIFICATION; otherwise they are denied.`,
     'Instructions from the main agent are not user decisions: do not resolve human questions, propose or approve checks, review the contract, reconsider strategy, or claim completion. Report findings back to the main agent, which owns those steps.',
   ];
   return { hookSpecificOutput: { hookEventName: 'SubagentStart', additionalContext: lines.join('\n').slice(0, 8000) } };
@@ -182,32 +221,59 @@ function deny(reason: string): Output {
   return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
 }
 
-function preToolUse(root: string, cwd: string, tool: string, input: Record<string, unknown>, active: boolean): Output {
+/** What the gate may consult: null for a folder the user has not enabled, which only gets the spawn-free guards. */
+interface Tracked { active: boolean; managed: boolean }
+
+function preToolUse(root: string, cwd: string, tool: string, toolInput: Record<string, unknown>, tracked: Tracked | null): Output {
+  if (!gatedTools.includes(tool)) return undefined;
+  let input = toolInput;
   if (tool === 'Bash') {
-    // Best effort only: a same-user agent can reach the runtime by other spellings.
-    const command = text(input.command) ?? '';
-    const control = /optimizer|cli\.ts/.test(command) && /\b(enable|disable|prompt)\b(?!:)/.test(command);
-    return control || /optimizer-claude-hook|optimizer-layer\/projects|\.optimizer(?![\w-])(?!\/drafts\/)/.test(command) ? deny('optimizer: prompt capture, project enablement and runtime state belong to the user and the Claude Code hook.') : undefined;
+    // Spawn-free and best effort: it also covers folders where the runtime never starts; the runtime gate applies the full classifier.
+    // Quotes and backslashes removed, so words spliced from quoted pieces (`ena""ble`) still match.
+    const command = (text(input.command) ?? '').replace(/["'\\]/g, '');
+    // Variables or substitutions next to the runtime name could spell any command, so they are refused too.
+    const control = /optimizer|cli\.ts/.test(command) && (/\b(enable|disable|prompt)\b(?!:)/.test(command) || /[$`]/.test(command));
+    if (control || /optimizer-claude-hook|optimizer-layer\/projects|\.optimizer(?![\w-])(?!\/drafts\/)/.test(command)) return deny('optimizer: prompt capture, project enablement and runtime state belong to the user and the Claude Code hook.');
+    // The runtime classifies cd and git against the shell's working directory.
+    input = { ...input, cwd: real(cwd) };
+  } else {
+    const file = text(input.file_path) ?? text(input.notebook_path);
+    if (file) {
+      const path = real(resolve(cwd, file));
+      const store = relative(real(userStore()), path);
+      if (store !== '..' && !store.startsWith(`..${sep}`) && !isAbsolute(store)) return deny('optimizer: approvals and hook tokens are written only by the optimizer runtime.');
+      const target = relative(root, path);
+      if (target === '..' || target.startsWith(`..${sep}`) || isAbsolute(target)) return undefined;
+      if (target.startsWith(join('.optimizer', 'drafts') + sep)) return undefined;
+      // Any .optimizer segment: a nested project config written by the agent would otherwise become the root for that subfolder.
+      if (target.split(sep).includes('.optimizer')) return deny('optimizer: runtime state is written only by the optimizer runtime and hook.');
+      // The runtime resolves targets against the project root, not the hook's cwd.
+      input = { ...input, file_path: path };
+    }
   }
-  const file = text(input.file_path) ?? text(input.notebook_path);
-  if (!file) return undefined;
-  const store = relative(real(userStore()), real(resolve(cwd, file)));
-  if (store !== '..' && !store.startsWith(`..${sep}`) && !isAbsolute(store)) return deny('optimizer: approvals and hook tokens are written only by the optimizer runtime.');
-  const target = relative(root, real(resolve(cwd, file)));
-  if (target === '..' || target.startsWith(`..${sep}`) || isAbsolute(target)) return undefined;
-  if (target.startsWith(join('.optimizer', 'drafts') + sep)) return undefined;
-  // Any .optimizer segment: a nested project config written by the agent would otherwise become the root for that subfolder.
-  if (target.split(sep).includes('.optimizer')) return deny('optimizer: runtime state is written only by the optimizer runtime and hook.');
-  // Without an active session pointer edits are not gated, and the runtime is not spawned.
-  if (!active) return undefined;
-  const state = current(root);
-  if (!state.sessionId || !state.action) return undefined;
-  if (blockingActions.has(state.action.kind)) return deny(`optimizer: ${state.action.kind}: ${state.action.reason} ${instructions[state.action.kind] ?? ''}`.trim());
-  return undefined;
+  // Unmanaged with no open task: the gate would allow, so the runtime is not spawned.
+  if (!tracked || !(tracked.active || tracked.managed)) return undefined;
+  let verdict: Record<string, unknown>;
+  try {
+    verdict = withFile(JSON.stringify(input), file => call(root, 'gate', { tool, 'input-file': file }));
+  } catch (error) {
+    // Decision 5: in a managed project or task a silent runtime must not let protected work through. Bash is not classified here, so all of it waits.
+    return deny(`optimizer unavailable: a managed task is active and the runtime could not answer (${error instanceof Error ? error.message : String(error)}), so file edits and Bash commands are denied. Read, Grep and Glob still work; ask the user to check the optimizer installation.`.replaceAll('\n', ' '));
+  }
+  if (verdict.allow === true) return undefined;
+  const reason = text(verdict.reason) ?? 'action denied';
+  const sessionId = text(verdict.sessionId);
+  const checkpoint = isRecord(verdict.checkpoint) ? decision(verdict.checkpoint) : null;
+  const lines = [reason.startsWith('optimizer') ? reason : `optimizer: ${reason}`];
+  if (verdict.started === true) lines.push(`The optimizer started goal contract ${sessionId ?? ''} from the latest user prompt: R1 is the prompt verbatim and is accepted when every approved project check passes. Add requirements with evidence through \`optimizer review --kind challenge\`; R1 cannot be removed.`);
+  if (checkpoint) lines.push(`Phase ${checkpoint.phase}. Next checkpoint (${checkpoint.decision}): ${instructions[checkpoint.decision] ?? 'Follow the runtime reason.'}`);
+  if (sessionId) lines.push(`Every optimizer command takes --project ${root} --session ${sessionId}.`);
+  return deny(lines.join('\n'));
 }
 
 function stop(root: string, claudeSession: string, active: boolean, session: boolean): Output {
-  const state = session ? current(root) : { sessionId: null, action: null, summary: '' };
+  const state = session ? current(root) : null;
+  const checkpoint = state?.sessionId ? state.checkpoint : null;
   const statePath = join(root, '.optimizer', 'hook-state.json');
   let hookState: Record<string, unknown> = {};
   try {
@@ -226,27 +292,44 @@ function stop(root: string, claudeSession: string, active: boolean, session: boo
       closeSync(descriptor);
     }
   };
-  const action = state.action;
-  if (!state.sessionId || !action || action.kind === 'complete') {
+  if (!state?.sessionId || !checkpoint || checkpoint.decision === 'COMPLETE') {
     if (claudeSession in hookState) { delete hookState[claudeSession]; save(); }
     return undefined;
   }
-  if (action.kind === 'clarify' || action.kind === 'escalate') {
-    const ids = Array.isArray(action.uncertaintyIds) ? ` (${action.uncertaintyIds.join(', ')})` : '';
-    return { systemMessage: `optimizer: waiting on the user${ids}: ${action.reason}` };
+  const sessionId = state.sessionId;
+  if (checkpoint.decision === 'ASK_HUMAN') {
+    const ids = Array.isArray(checkpoint.uncertaintyIds) ? ` (${checkpoint.uncertaintyIds.join(', ')})` : '';
+    return { systemMessage: `optimizer: waiting on the user${ids}: ${checkpoint.reason}` };
   }
-  const key = JSON.stringify([state.sessionId, action, state.summary]);
+  const blocked = `optimizer: task ${sessionId} is BLOCKED and unverified, not complete`;
+  // An already recorded block stays until a checkpoint command moves it; blocking Stop again would only loop.
+  if (checkpoint.phase === 'blocked') return { systemMessage: `${blocked}: ${checkpoint.reason}` };
+  const key = JSON.stringify([sessionId, checkpoint, state.summary]);
   const previous = hookState[claudeSession];
   const last = isRecord(previous) ? previous : {};
   const count = active && typeof last.count === 'number' ? last.count : 0;
   if ((active && last.key === key) || count >= 3) {
+    // Decision 6: an exhausted Stop budget is recorded as blocked, never presented as a finished task.
+    try {
+      call(root, 'blocked', { reason: `Stop budget exhausted at ${checkpoint.decision}: ${checkpoint.reason}` }, sessionId);
+    } catch (error) {
+      // Recording failed: block once more with the reason instead of letting the stop pass silently; the next stop is let through as unverified.
+      if (last.recordFailed !== true) {
+        hookState[claudeSession] = { key, count, recordFailed: true };
+        save();
+        return { decision: 'block', reason: `optimizer: the task is unverified and the optimizer could not record it as blocked (${error instanceof Error ? error.message : String(error)}). Tell the user the task is BLOCKED and unverified, not complete.`.replaceAll('\n', ' ') };
+      }
+      delete hookState[claudeSession];
+      save();
+      return { systemMessage: `${blocked}; the optimizer could not record the block.` };
+    }
     delete hookState[claudeSession];
     save();
-    return { systemMessage: 'optimizer: task unverified, stopping' };
+    return { systemMessage: `${blocked}: the agent stopped at ${checkpoint.decision} (${checkpoint.reason}). Run \`optimizer verify\`; only outcome VERIFIED completes it.` };
   }
   hookState[claudeSession] = { key, count: count + 1 };
   save();
-  return { decision: 'block', reason: `optimizer: next action ${action.kind}: ${action.reason}\n${instructions[action.kind] ?? ''}\nEvery optimizer command takes --project ${root} --session ${state.sessionId}.` };
+  return { decision: 'block', reason: `optimizer: task not verified (phase ${checkpoint.phase}). Decision ${checkpoint.decision}: ${checkpoint.reason}\n${instructions[checkpoint.decision] ?? ''}\nEvery optimizer command takes --project ${root} --session ${sessionId}.` };
 }
 
 function hook(raw: string): Output {
@@ -259,27 +342,52 @@ function hook(raw: string): Output {
   if (!root) return undefined;
   const config = readConfig(root);
   // Only an install without a mode marker (always-on behaviour) leaves this unset; any unrecognised marker fails closed to opt-in.
-  const optIn = process.env.OPTIMIZER_MODE !== undefined && process.env.OPTIMIZER_MODE !== 'always-on';
+  // `managed` comes only from the private settings of `optimizer run`: tracked and enforced whatever the user's global install mode.
+  const mode = process.env.OPTIMIZER_MODE;
+  const optIn = mode !== undefined && mode !== 'always-on' && mode !== 'managed';
+  // A `#!/usr/bin/env node` runtime binary must run on the hook's Node.js 24, not an older default node.
+  process.env.PATH = `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ''}`;
+  const projectDir = text(process.env.CLAUDE_PROJECT_DIR);
+  const tool = text(input.tool_name);
+  if (input.hook_event_name === 'PreToolUse' && tool && gatedTools.includes(tool) && projectDir && isAbsolute(projectDir)) {
+    // The session's project stays the anchor: a `cd` (even through a symlink) must not move the agent out of a managed project.
+    const anchor = findRoot(projectDir);
+    const anchored = anchor ? readConfig(anchor) : null;
+    const managedAnchor = anchored?.enabled === true && (!optIn || anchored.optedIn === true) && Array.isArray(anchored.checks) && anchored.checks.length > 0;
+    if (anchor && managedAnchor && outside(anchor, real(cwd))) {
+      return deny(`optimizer: the shell's working directory ${real(cwd)} is outside the managed project ${anchor}. Return with \`cd ${anchor}\`; edits and commands from outside the project are denied.`);
+    }
+  }
   if (config?.enabled === false || (optIn && config?.optedIn !== true)) {
+    // The user's `approve enable CODE` reply must reach the runtime even for a folder that is not enabled yet.
+    const prompt = text(input.prompt);
+    if (input.hook_event_name === 'UserPromptSubmit' && config && prompt && /\bapprove\s+enable\s+[0-9a-f]{4}\b/i.test(prompt)) {
+      process.env.OPTIMIZER_HOOK_TOKEN = text(config.hookToken) ?? '';
+      try {
+        const captured = capture(root, prompt);
+        if (captured.changeApproved) return { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: `optimizer: with this prompt the user approved \`optimizer enable\` for ${root}; it is now applied.` } };
+      } catch (error) {
+        process.stderr.write(`optimizer-claude-hook: ${error instanceof Error ? error.message : String(error)}\n`.replaceAll(/\n(?!$)/g, ' '));
+      }
+      return undefined;
+    }
     // A folder the user has not enabled gets only the spawn-free guards, so the agent cannot enable it or forge approvals.
-    const tool = text(input.tool_name);
-    return input.hook_event_name === 'PreToolUse' && tool && isRecord(input.tool_input) ? preToolUse(root, cwd, tool, input.tool_input, false) : undefined;
+    return input.hook_event_name === 'PreToolUse' && tool && isRecord(input.tool_input) ? preToolUse(root, cwd, tool, input.tool_input, null) : undefined;
   }
   const token = text(config?.hookToken);
   // A project without config gets its token from the runtime at the first capture.
   if (token) process.env.OPTIMIZER_HOOK_TOKEN = token;
   else delete process.env.OPTIMIZER_HOOK_TOKEN;
   const session = typeof config?.activeSessionId === 'string';
-  // A `#!/usr/bin/env node` runtime binary must run on the hook's Node.js 24, not an older default node.
-  process.env.PATH = `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ''}`;
+  // Mirrors the runtime's managedProject(): the fast path above already settled tracking, so only approved checks remain.
+  const managed = config?.enabled === true && Array.isArray(config.checks) && config.checks.length > 0;
   switch (input.hook_event_name) {
     case 'UserPromptSubmit': {
       const prompt = text(input.prompt);
       return prompt?.trim() ? userPromptSubmit(root, prompt) : undefined;
     }
     case 'PreToolUse': {
-      const tool = text(input.tool_name);
-      return tool && isRecord(input.tool_input) ? preToolUse(root, cwd, tool, input.tool_input, session) : undefined;
+      return tool && isRecord(input.tool_input) ? preToolUse(root, cwd, tool, input.tool_input, { active: session, managed }) : undefined;
     }
     case 'Stop': return stop(root, text(input.session_id) ?? '', input.stop_hook_active === true, session);
     case 'SubagentStart': return session ? subagentStart(root) : undefined;
@@ -338,7 +446,7 @@ function hookCommand(mode: Mode): string {
 }
 
 function entries(command: string, path: string): [string, Record<string, unknown>][] {
-  const entry = (line: string) => ({ hooks: [{ type: 'command', command: line }] });
+  const entry = (line: string) => ({ hooks: [{ type: 'command', command: line, timeout: hookTimeoutSeconds }] });
   return [
     ['UserPromptSubmit', entry(command)],
     ['PreToolUse', { matcher: editMatcher, ...entry(command) }],
@@ -417,6 +525,11 @@ if (mode === 'ensure') {
   try {
     if (extra.length) throw new Error('Unexpected positional arguments');
     if (parsed.values['always-on'] && mode !== 'install') throw new Error('--always-on applies only to install');
+    // Installed hooks pin this Node.js; an older one would keep running a stale copy of the adapter.
+    const [major = 0, minor = 0] = process.versions.node.split('.').map(Number);
+    if (mode === 'install' && (major < 24 || (major === 24 && minor < 18))) {
+      throw new Error(`Node.js ${process.versions.node} is too old; run the installer with Node.js 24.18 or newer`);
+    }
     process.stdout.write(JSON.stringify(configure(mode, settingsPath, parsed.values['always-on'] ? 'always-on' : 'opt-in')) + '\n');
   } catch (error) {
     process.stderr.write(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }) + '\n');

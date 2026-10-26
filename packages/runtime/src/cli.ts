@@ -1,13 +1,22 @@
 #!/usr/bin/env node
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { isAbsolute, resolve } from 'node:path';
+import { claudeArgs, findExecutable, managedRun } from './managed.ts';
 import { parseArgs, type ParseArgsOptionsConfig } from 'node:util';
-import { Runtime } from './runtime.ts';
-import { capturePrompt, disableProject, enableProject, projectView, proposeChecks, readProjectConfig, sessionSummary } from './project.ts';
+import { gate, Runtime } from './runtime.ts';
+import { sameSecret } from './user-store.ts';
+import { capturePrompt, disableProject, enableProject, requestProjectChange, projectView, proposeChecks, readProjectConfig, sessionSummary } from './project.ts';
 import { startDashboard } from './dashboard.ts';
 import { parseAssessment, parseReviewResponse } from './schema.ts';
 
 const usage = `optimizer COMMAND --project PATH [--session ID]
 optimizer dashboard [--port N]   (local read-only web page; default port 8790, 0 picks a free one)
+optimizer run --project PATH --prompt-file F [--max-turns N] [--timeout-ms N] [--claude PATH] [--hook PATH]
+              [--claude-args="ARGS"] (extra claude arguments, whitespace-split without a shell,
+              e.g. --claude-args="--permission-mode acceptEdits --allowedTools Bash")
+              (Managed Execution: starts the contract from F, runs \`claude -p\` under enforced
+              hooks, then verifies; exit 0 only for outcome VERIFIED. Defaults: 30 turns,
+              1800000 ms, \`claude\` and \`optimizer-claude-hook\` from PATH)
 Commands:
   init
   propose-check --check CMD [--check CMD ...] [--timeout-ms N]
@@ -17,6 +26,8 @@ Commands:
               existing checks are kept and the agent can propose one;
               --yes accepts the package.json test script when --check is omitted)
   disable     (per-project opt-out of the hooks)
+              enable/disable apply directly only from an interactive terminal; otherwise they
+              return an approval phrase (approve enable|disable CODE) the user types in Claude Code
   prompt      --file PROMPT.txt (hook capture; requires OPTIMIZER_HOOK_TOKEN)
   current
   start       --request GOAL.md [--checks CHECKS.json, only without approved project checks] [--replace]
@@ -30,7 +41,14 @@ Commands:
   check       --check CHECK_ID
   reconsider  --strategy retain|revise --rationale TEXT
   claim
-  verify
+  verify      (adds outcome VERIFIED|FAILED|INCONCLUSIVE|NEEDS_HUMAN_REVIEW and phase)
+  experiences [--session ID] (decision experiences with observed outcomes; no goal or prompt text)
+  decide      [--session ID] (structured controller decision; defaults to the active session)
+  gate        --tool NAME [--input-file TOOL_INPUT.json] (policy verdict for one host tool call;
+              a protected action in a managed project with no open session starts one from
+              the latest captured prompt; never fails for a missing session)
+  start-from-prompt --prompt ID (hook only; requires OPTIMIZER_HOOK_TOKEN)
+  blocked     --reason TEXT [--session ID] (hook only; records an exhausted Stop budget)
   status
   events      [--after SEQUENCE] [--limit COUNT]
   metrics
@@ -63,8 +81,11 @@ function main(): unknown {
   const options: ParseArgsOptionsConfig = Object.fromEntries([
     'project', 'session', 'request', 'checks', 'file', 'kind', 'rationale', 'items',
     'question', 'source', 'answer', 'strategy', 'after', 'limit', 'version', 'requirement', 'owner', 'timeout-ms', 'port',
+    'tool', 'input-file', 'prompt', 'reason', 'prompt-file', 'max-turns', 'claude', 'hook', 'claude-args',
   ].map(name => [name, { type: 'string' }]));
   options.check = { type: 'string', multiple: true };
+  // Repeated --project is refused (required() takes exactly one), so the classifier and the CLI never disagree on the target.
+  options.project = { type: 'string', multiple: true };
   for (const name of ['help', 'yes', 'replace']) options[name] = { type: 'boolean' };
   const parsed = parseArgs({ allowPositionals: true, strict: true, options });
   if (parsed.values.help) {
@@ -73,7 +94,7 @@ function main(): unknown {
   }
   const [command, ...extra] = parsed.positionals;
   if (extra.length) throw new Error('Unexpected positional arguments');
-  const commands = new Set(['init', 'dashboard', 'propose-check', 'enable', 'disable', 'prompt', 'current', 'start', 'history', 'retrieve', 'assess', 'review', 'resolve', 'next', 'check', 'reconsider', 'claim', 'verify', 'status', 'events', 'metrics']);
+  const commands = new Set(['init', 'dashboard', 'propose-check', 'enable', 'disable', 'prompt', 'current', 'start', 'history', 'retrieve', 'assess', 'review', 'resolve', 'next', 'check', 'reconsider', 'claim', 'verify', 'status', 'events', 'metrics', 'decide', 'gate', 'start-from-prompt', 'blocked', 'experiences', 'run']);
   if (!command || !commands.has(command)) throw new Error(`Unknown command: ${command ?? '(missing)'}`);
   const required = (name: string): string => {
     const input = parsed.values[name];
@@ -96,16 +117,50 @@ function main(): unknown {
   if (command === 'propose-check') {
     return proposeChecks(project, { commands: checkCommands(parsed.values.check), timeoutMs: timeoutMs(parsed.values['timeout-ms']) });
   }
-  if (command === 'enable') {
-    return enableProject(project, { commands: checkCommands(parsed.values.check), timeoutMs: timeoutMs(parsed.values['timeout-ms']), yes: parsed.values.yes === true });
+  if (command === 'enable' || command === 'disable') {
+    const input = { commands: checkCommands(parsed.values.check), timeoutMs: timeoutMs(parsed.values['timeout-ms']), yes: parsed.values.yes === true };
+    // User proof: a human at a terminal. Claude Code's Bash tool (and `!` commands) are non-interactive, so they only create a request.
+    const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
+    if (!interactive) return requestProjectChange(project, command, input);
+    return command === 'enable' ? enableProject(project, input) : disableProject(project);
   }
-  if (command === 'disable') return disableProject(project);
+  if (command === 'run') {
+    const executable = (name: string, fallback: string): string => {
+      const value = parsed.values[name];
+      const path = typeof value === 'string' ? resolve(value) : findExecutable(fallback);
+      if (!path) throw new Error(`${fallback} not found on PATH; pass --${name} PATH`);
+      return path;
+    };
+    const configured = process.env.OPTIMIZER_BIN;
+    const result = managedRun({
+      project, prompt: readInput(required('prompt-file')),
+      maxTurns: typeof parsed.values['max-turns'] === 'string' ? pageNumber(parsed.values['max-turns'], 'max-turns', 1000) : 30,
+      timeoutMs: typeof parsed.values['timeout-ms'] === 'string' ? pageNumber(parsed.values['timeout-ms'], 'timeout-ms', 4 * 60 * 60 * 1000) : 30 * 60 * 1000,
+      claude: executable('claude', 'claude'), hook: executable('hook', 'optimizer-claude-hook'),
+      claudeArgs: typeof parsed.values['claude-args'] === 'string' ? claudeArgs(parsed.values['claude-args']) : [],
+      runtimeBin: configured && isAbsolute(configured) ? configured : realpathSync(process.argv[1] ?? ''),
+    });
+    // An unverified or failed run is never reported as success.
+    if (result.outcome !== 'VERIFIED') process.exitCode = 1;
+    return result;
+  }
   if (command === 'prompt') return capturePrompt(project, readInput(required('file')), process.env.OPTIMIZER_HOOK_TOKEN);
+  if (command === 'gate') {
+    const input: unknown = typeof parsed.values['input-file'] === 'string' ? JSON.parse(readInput(parsed.values['input-file'])) : {};
+    if (typeof input !== 'object' || input === null || Array.isArray(input)) throw new Error('Tool input must be a JSON object');
+    return gate(project, required('tool'), { ...input });
+  }
+  if (command === 'start-from-prompt' || command === 'blocked') {
+    const config = readProjectConfig(project);
+    if (!config || !sameSecret(process.env.OPTIMIZER_HOOK_TOKEN ?? '', config.hookToken)) throw new Error(`${command} requires the hook token`);
+  }
+  const active = (): string | null => typeof parsed.values.session === 'string' ? parsed.values.session : readProjectConfig(project)?.activeSessionId ?? null;
+  if (command === 'decide' && !active()) return { sessionId: null, decision: null, reason: 'No active optimizer session.' };
   if (command === 'current') {
     const config = readProjectConfig(project);
     const { activeSessionId, ...view } = projectView(config);
-    if (!view.enabled) return { ...view, sessionId: null, action: null, summary: '' };
-    if (!activeSessionId) return { ...view, sessionId: null, action: null, summary: 'No active optimizer session.' };
+    if (!view.enabled) return { ...view, sessionId: null, action: null, phase: null, checkpoint: null, summary: '' };
+    if (!activeSessionId) return { ...view, sessionId: null, action: null, phase: null, checkpoint: null, summary: 'No active optimizer session.' };
   }
   const runtime = new Runtime(project);
   try {
@@ -114,12 +169,20 @@ function main(): unknown {
       const { activeSessionId: sessionId, ...view } = projectView(readProjectConfig(project));
       if (!sessionId) throw new Error('No active session');
       const action = runtime.next(sessionId);
-      return { ...view, sessionId, action, summary: sessionSummary(runtime.get(sessionId), action) };
+      const checkpoint = runtime.decide(sessionId);
+      return { ...view, sessionId, action, phase: checkpoint.phase, checkpoint, summary: sessionSummary(runtime.get(sessionId), action) };
     }
     if (command === 'start') {
       const checks: unknown = typeof parsed.values.checks === 'string' ? JSON.parse(readInput(required('checks'))) : undefined;
-      return runtime.start({ request: readInput(required('request')), ...(checks === undefined ? {} : { checks }), replace: parsed.values.replace === true });
+      return runtime.start({ request: readInput(required('request')), ...(checks === undefined ? {} : { checks }), replace: parsed.values.replace === true, agent: true });
     }
+    if (command === 'start-from-prompt') {
+      const { session, created } = runtime.startFromPrompt(required('prompt'));
+      return { session, created, checkpoint: runtime.decide(session.id) };
+    }
+    if (command === 'experiences') return runtime.experiences(typeof parsed.values.session === 'string' ? parsed.values.session : undefined);
+    if (command === 'decide') return runtime.decide(active() ?? required('session'));
+    if (command === 'blocked') return runtime.block(active() ?? required('session'), required('reason'));
     const sessionId = required('session');
     switch (command) {
       case 'history': return runtime.importHistory(sessionId, required('file'));

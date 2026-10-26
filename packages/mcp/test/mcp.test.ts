@@ -48,7 +48,7 @@ test('official SDK initializes stdio server and exposes only two annotated read-
   t.after(() => runtime.close());
   const client = await connect(t, projectRoot);
   assert.equal(LATEST_PROTOCOL_VERSION, '2025-11-25');
-  assert.deepEqual(client.getServerVersion(), { name: 'optimizer-layer', version: '0.2.1' });
+  assert.deepEqual(client.getServerVersion(), { name: 'optimizer-layer', version: '0.3.0' });
   const tools = await client.listTools();
   assert.deepEqual(tools.tools.map(tool => tool.name).sort(), ['optimizer_session_events', 'optimizer_session_status']);
   assert.ok(tools.tools.every(tool => tool.annotations?.readOnlyHint === true && tool.annotations.destructiveHint === false));
@@ -87,7 +87,7 @@ test('event pagination uses sequence cursors and returns bounded metadata withou
     events: firstTwo.map(({ sequence, event }) => ({ sequence, at: event.at, kind: event.payload.kind })),
     nextAfterSequence: firstTwo.at(-1)?.sequence,
   });
-  const last = await client.callTool({ name: 'optimizer_session_events', arguments: { sessionId: session.id, limit: 2, afterSequence: firstTwo.at(-1)?.sequence } });
+  const last = await client.callTool({ name: 'optimizer_session_events', arguments: { sessionId: session.id, limit: 100, afterSequence: firstTwo.at(-1)?.sequence } });
   assert.deepEqual(last.structuredContent, {
     sessionId: session.id,
     events: events.slice(2).map(({ sequence, event }) => ({ sequence, at: event.at, kind: event.payload.kind })),

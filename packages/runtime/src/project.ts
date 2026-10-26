@@ -62,7 +62,7 @@ function loadOrCreate(root: string): ProjectConfig {
   // Side effects first, so a failure is retried on the next use instead of leaving an unregistered project.
   excludeFromGit(root);
   registerProject(root);
-  const config: ProjectConfig = { projectRoot: root, enabled: true, hookToken: randomBytes(32).toString('hex'), checks: [], activeSessionId: null, pendingChecks: null };
+  const config: ProjectConfig = { projectRoot: root, enabled: true, hookToken: randomBytes(32).toString('hex'), checks: [], activeSessionId: null, pendingChecks: null, pendingChange: null };
   writeProjectConfig(root, config);
   return config;
 }
@@ -128,8 +128,7 @@ function checkDefinitions(commands: string[], root: string, timeoutMs: number) {
   })));
 }
 
-export function enableProject(projectRoot: string, input: { commands: string[]; timeoutMs: number; yes: boolean }) {
-  const root = canonicalRoot(projectRoot);
+function enableCommands(root: string, input: { commands: string[]; yes: boolean }): { commands: string[]; suggestion: string | undefined } {
   let commands = input.commands;
   let suggestion: string | undefined;
   if (!commands.length) {
@@ -140,6 +139,13 @@ export function enableProject(projectRoot: string, input: { commands: string[]; 
     if (hasTest && input.yes) commands = ['npm test'];
     else if (hasTest) suggestion = "Re-run with --yes to approve --check 'npm test' (from package.json scripts.test), or let the agent propose a check.";
   }
+  return { commands, suggestion };
+}
+
+/** Direct enable: library callers and a user at an interactive terminal. Non-interactive callers use requestProjectChange. */
+export function enableProject(projectRoot: string, input: { commands: string[]; timeoutMs: number; yes: boolean }) {
+  const root = canonicalRoot(projectRoot);
+  const { commands, suggestion } = enableCommands(root, input);
   // Validate checks before creating any state, so a rejected command leaves nothing behind.
   const approved = commands.length ? checkDefinitions(commands, root, input.timeoutMs).map(check => registerArtifacts(root, check)) : null;
   const config = loadOrCreate(root);
@@ -147,7 +153,7 @@ export function enableProject(projectRoot: string, input: { commands: string[]; 
   runtimeDirectory(root);
   // Without --check the project is enabled with its current checks; the agent proposes one and the user approves it by code.
   const checks = approved ?? config.checks;
-  writeProjectConfig(root, { ...config, enabled: true, optedIn: true, checks, pendingChecks: commands.length ? null : config.pendingChecks });
+  writeProjectConfig(root, { ...config, enabled: true, optedIn: true, checks, pendingChecks: commands.length ? null : config.pendingChecks, pendingChange: null });
   return { projectRoot: root, enabled: true, checks: checks.map(({ id, argv, timeoutMs }) => ({ id, argv, timeoutMs })), ...(suggestion ? { suggestion } : {}) };
 }
 
@@ -174,8 +180,33 @@ export function proposeChecks(projectRoot: string, input: { commands: string[]; 
 
 export function disableProject(projectRoot: string) {
   const root = canonicalRoot(projectRoot);
-  writeProjectConfig(root, { ...loadOrCreate(root), enabled: false });
+  writeProjectConfig(root, { ...loadOrCreate(root), enabled: false, pendingChange: null });
   return { projectRoot: root, enabled: false };
+}
+
+/**
+ * Without a human at a terminal, enable/disable (and the checks enable would approve) only become a pending request.
+ * Like a check proposal, only a hook-captured user prompt quoting `approve KIND CODE` applies it (see capturePrompt).
+ */
+export function requestProjectChange(projectRoot: string, kind: 'enable' | 'disable', input: { commands: string[]; timeoutMs: number; yes: boolean }) {
+  const root = canonicalRoot(projectRoot);
+  let checks: ReturnType<typeof checkDefinitions> | null = null;
+  if (kind === 'enable') {
+    const { commands } = enableCommands(root, input);
+    if (commands.length) {
+      checks = checkDefinitions(commands, root, input.timeoutMs);
+      for (const definition of checks) registerArtifacts(root, definition);
+    }
+  }
+  const config = loadOrCreate(root);
+  const code = randomBytes(2).toString('hex');
+  const pendingChecks = checks ? checks.map(({ artifactFiles: _, ...check }) => check) : null;
+  writeProjectConfig(root, { ...config, pendingChange: { code, kind, checks: pendingChecks } });
+  return {
+    projectRoot: root, pending: kind, code, approval: `approve ${kind} ${code}`,
+    ...(pendingChecks ? { checks: pendingChecks.map(({ id, argv, timeoutMs }) => ({ id, argv, timeoutMs })) } : {}),
+    message: `Not applied: no interactive terminal. Type \`approve ${kind} ${code}\` as your next Claude Code message to apply it, or run the command again in a terminal.`,
+  };
 }
 
 function approvalCodes(content: string): string[] {
@@ -187,10 +218,26 @@ export function capturePrompt(projectRoot: string, content: string, token: strin
   const existing = readProjectConfig(root);
   // The first capture creates the user-store token, so only a same-user process can make it; repository content never supplies one.
   const config = existing ?? loadOrCreate(root);
-  if (!config.enabled) throw new Error('Project is disabled');
   if (existing && !sameSecret(token ?? '', config.hookToken)) throw new Error('prompt requires the hook token');
+  const change = config.pendingChange;
+  const changeApproved = change !== null && new RegExp(`\\bapprove\\s+${change.kind}\\s+${change.code}\\b`, 'i').test(content);
+  // A disabled project still accepts the one prompt that approves re-enabling it.
+  if (!config.enabled && !changeApproved) throw new Error('Project is disabled');
   runtimeDirectory(root);
   const id = appendCapturedPrompt(root, content, config.hookToken);
+  if (change && changeApproved) {
+    try {
+      if (change.kind === 'disable') {
+        writeProjectConfig(root, { ...config, enabled: false, pendingChange: null });
+      } else {
+        const checks = change.checks ? parseChecks(change.checks).map(check => registerArtifacts(root, check)) : config.checks;
+        writeProjectConfig(root, { ...config, enabled: true, optedIn: true, checks, pendingChecks: change.checks ? null : config.pendingChecks, pendingChange: null });
+      }
+      return { id, checkApproved: false, changeApproved: change.kind };
+    } catch (error) {
+      return { id, checkApproved: false, approvalError: error instanceof Error ? error.message : String(error) };
+    }
+  }
   const pending = config.pendingChecks;
   if (pending === null || !approvalCodes(content).includes(pending.code)) return { id, checkApproved: false };
   // The prompt row is already recorded; a failed activation must not lose it.

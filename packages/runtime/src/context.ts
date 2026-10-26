@@ -418,14 +418,17 @@ export function promptLogPath(projectRoot: string): string {
   return join(rootPath(projectRoot), '.optimizer', 'prompts.jsonl');
 }
 
-/** Append one hook-captured user prompt verbatim, authenticated with the user-store token, and return its row ID. */
-export function appendCapturedPrompt(projectRoot: string, content: string, token: string): string {
+/**
+ * Append one captured prompt verbatim, authenticated with the user-store token, and return its row ID.
+ * `controller` rows (written by `optimizer run`) are MACed under a distinct role, so they can never pass as hook rows.
+ */
+export function appendCapturedPrompt(projectRoot: string, content: string, token: string, capturedBy: 'hook' | 'controller' = 'hook'): string {
   const root = rootPath(projectRoot);
   if (!content.trim() || content.length > 200_000) throw new Error('Prompt must be nonempty and at most 200000 characters');
   assertNoSymlinks(join(root, '.optimizer'));
   const row = { id: randomUUID(), projectRoot: root, role: 'user', content, timestamp: new Date().toISOString() };
   const id = row.id;
-  const line = JSON.stringify({ ...row, capturedBy: 'hook', mac: promptMac(token, row) }) + '\n';
+  const line = JSON.stringify({ ...row, capturedBy, mac: promptMac(token, capturedBy === 'hook' ? row : { ...row, role: 'controller' }) }) + '\n';
   const descriptor = openSync(promptLogPath(root), constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
   try {
     // shortcut: the log is capped at the transcript limit and capture stops when full; rotate once that happens in practice.
@@ -437,8 +440,12 @@ export function appendCapturedPrompt(projectRoot: string, content: string, token
   return id;
 }
 
-/** Hook-captured user prompts are whole-message decisions; per-row digests keep earlier rows fresh as the log grows. */
-export function capturedPrompts(projectRoot: string): Decision[] {
+/**
+ * Hook-captured user prompts are whole-message decisions; per-row digests keep earlier rows fresh as the log grows.
+ * Controller rows (`run:` IDs) are included only on request: they identify a managed run's request but never carry
+ * human authority, so they cannot resolve human questions or start a contract from the gate.
+ */
+export function capturedPrompts(projectRoot: string, includeController = false): Decision[] {
   const root = rootPath(projectRoot);
   const source = promptLogPath(root);
   if (!existsSync(source)) return [];
@@ -460,17 +467,20 @@ export function capturedPrompts(projectRoot: string): Decision[] {
       // A bad row carries no authority, but must not disable capture or the hooks for the valid ones.
       continue;
     }
-    const hook = typeof value === 'object' && value !== null && 'capturedBy' in value && value.capturedBy === 'hook'
-      && 'mac' in value && typeof value.mac === 'string' && sameSecret(value.mac, promptMac(token, row));
-    if (row.role !== 'user' || !hook || !row.content.trim()) continue;
+    const capturedBy = typeof value === 'object' && value !== null && 'capturedBy' in value ? value.capturedBy : undefined;
+    const mac = typeof value === 'object' && value !== null && 'mac' in value && typeof value.mac === 'string' ? value.mac : '';
+    const hook = capturedBy === 'hook' && sameSecret(mac, promptMac(token, row));
+    const controller = includeController && capturedBy === 'controller' && sameSecret(mac, promptMac(token, { ...row, role: 'controller' }));
+    if (row.role !== 'user' || !(hook || controller) || !row.content.trim()) continue;
     const digest = createHash('sha256').update(line).digest('hex');
-    decisions.push({ id: `prompt:${row.id}`, text: row.content.trim(), source, line: index + 1, digest, timestamp: row.timestamp, role: 'user', supersedes: [] });
+    decisions.push({ id: `${hook ? 'prompt' : 'run'}:${row.id}`, text: row.content.trim(), source, line: index + 1, digest, timestamp: row.timestamp, role: 'user', supersedes: [] });
   }
   return decisions;
 }
 
 export function sourceDecisions(projectRoot: string, source: string): Decision[] {
-  return source === promptLogPath(projectRoot) ? capturedPrompts(projectRoot) : importConversation(projectRoot, source);
+  // Freshness checks see controller rows too; authority checks (resolve, gate auto-start) use capturedPrompts directly.
+  return source === promptLogPath(projectRoot) ? capturedPrompts(projectRoot, true) : importConversation(projectRoot, source);
 }
 
 export function isContextCurrent(projectRoot: string, context: ContextSnapshot): boolean {

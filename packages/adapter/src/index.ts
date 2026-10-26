@@ -3,7 +3,8 @@ import { isAbsolute } from 'node:path';
 
 export type OptimizerCommand =
   | 'init' | 'propose-check' | 'enable' | 'disable' | 'prompt' | 'current' | 'start' | 'history' | 'retrieve' | 'assess' | 'review' | 'resolve' | 'next'
-  | 'check' | 'reconsider' | 'claim' | 'verify' | 'status' | 'events' | 'metrics';
+  | 'check' | 'reconsider' | 'claim' | 'verify' | 'status' | 'events' | 'metrics'
+  | 'decide' | 'gate' | 'start-from-prompt' | 'blocked';
 
 export interface OptimizerInput {
   executable: string;

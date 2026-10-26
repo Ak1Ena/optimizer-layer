@@ -1,12 +1,18 @@
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { isAbsolute, join, resolve } from 'node:path';
 import { Store } from './store.ts';
+import { availableActions, chooseAction, ruleModel, shadowModel, stateFeatures } from './decision-model.ts';
+import { classifyTool, decide, evaluate, managedProject, phaseFor, projectChecksAcceptance, reservedAction, verificationOutcome, type Decision, type GateAction } from './controller.ts';
 import { extractGoal, assessGate, nextAction, verifiedRequirementIds } from './intelligence.ts';
 import { capturedPrompts, importConversation, isContextCurrent, projectDigest, retrieveContext, sourceDecisions } from './context.ts';
 import { assertSafeArgv, readProjectConfig, writeProjectConfig } from './project.ts';
+import { canonicalRoot } from './user-store.ts';
 import { nonempty, parseAssessment, parseChecks, parseReviewResponse } from './schema.ts';
 import { runCommand } from './process.ts';
 import { artifactsCurrent, registerArtifacts } from './verification.ts';
-import type { ContextAssessment, Control, Goal, Measurement, ReviewResponse, SessionState, VerificationEvidence } from './types.ts';
+import type { ContextAssessment, Control, Decision as UserDecision, Goal, Measurement, NextAction, Phase, ReviewResponse, SessionState, VerificationEvidence } from './types.ts';
+import type { ProjectConfig } from './schema.ts';
 
 export class Runtime {
   readonly projectRoot: string;
@@ -40,8 +46,9 @@ export class Runtime {
     }
   }
 
-  #current(state: SessionState): SessionState {
-    const contextCurrent = state.context !== null && isContextCurrent(this.projectRoot, state.context);
+  /** `trustContext` keeps the reviewed snapshot while executing; verification still requires current context. */
+  #current(state: SessionState, trustContext = false): SessionState {
+    const contextCurrent = state.context !== null && (trustContext || isContextCurrent(this.projectRoot, state.context));
     const validChecks = new Set(state.checks.filter(artifactsCurrent).map(check => check.id));
     const superseded = new Set(state.decisions.flatMap(item => item.supersedes));
     const freshDecisionIds = new Set<string>();
@@ -77,8 +84,118 @@ export class Runtime {
     };
   }
 
+  #action(state: SessionState): NextAction {
+    if (state.checks.some(check => !artifactsCurrent(check))) {
+      return { kind: 'escalate', route: 'human', reason: 'Registered verifier artifacts changed; an operator must register a new contract.' };
+    }
+    return nextAction(state);
+  }
+
+  #transition(sessionId: string, to: Phase, cause: string): void {
+    const stored = this.#store.update(sessionId, state => ({ kind: 'workflow.transitioned', from: state.phase ?? null, to, cause }));
+    if (to === 'blocked') this.#backfill(sessionId, 'BLOCKED', this.#current(stored));
+  }
+
+  /** One decision experience per distinct (phase, decision); repeated identical queries add nothing. */
+  #record(sessionId: string, state: SessionState, next: NextAction): void {
+    const checkpoint = decide(state, next);
+    const events = this.#store.events(sessionId);
+    const last = events.findLast(item => item.event.payload.kind === 'decision.recorded')?.event.payload;
+    if (last?.kind === 'decision.recorded' && last.chosenAction === checkpoint.decision && last.features.phase === checkpoint.phase) return;
+    const features = stateFeatures(state, checkpoint.phase, { startedAt: events[0]?.event.at ?? new Date().toISOString(), events: events.length, now: Date.now() });
+    const actions = availableActions(checkpoint.decision);
+    const model = ruleModel(checkpoint.decision);
+    let shadow: { version: string; ranking: ReturnType<typeof model.rank> } | undefined;
+    const candidate = shadowModel(process.env.OPTIMIZER_SHADOW_MODEL);
+    try {
+      if (candidate) shadow = { version: candidate.version, ranking: candidate.rank(features, actions) };
+    } catch {
+      // A failing shadow model is dropped; it must never affect the real decision.
+    }
+    this.#store.update(sessionId, () => ({
+      kind: 'decision.recorded', decisionId: randomUUID(), features, availableActions: actions,
+      chosenAction: chooseAction(model, features, actions), decisionModelVersion: model.version, ...(shadow ? { shadow } : {}),
+    }));
+  }
+
+  /** Attaches the observed outcome to every decision recorded since the previous outcome. Token usage is unknown, never invented. */
+  #backfill(sessionId: string, outcome: ReturnType<typeof verificationOutcome> | 'BLOCKED', state: SessionState): void {
+    const events = this.#store.events(sessionId);
+    const since = events.findLastIndex(item => item.event.payload.kind === 'decision.outcome');
+    const now = Date.now();
+    const decisions = events.slice(since + 1).flatMap(({ event }) => event.payload.kind === 'decision.recorded'
+      ? [{ decisionId: event.payload.decisionId, additionalTimeMs: Math.max(0, now - Date.parse(event.at)) }] : []);
+    if (!decisions.length) return;
+    this.#store.update(sessionId, () => ({
+      kind: 'decision.outcome', outcome, verificationProgress: { verified: verifiedRequirementIds(state).length, total: state.goal.requirements.length },
+      goalSatisfied: outcome === 'VERIFIED', additionalTokens: null, decisions,
+    }));
+  }
+
+  /** Decision experiences joined with their observed outcomes, for offline training and analysis. */
+  experiences(sessionId?: string) {
+    return (sessionId ? [sessionId] : this.#store.sessionIds()).flatMap(id => {
+      const events = this.#store.events(id);
+      const outcomes = new Map<string, unknown>();
+      for (const { event } of events) {
+        if (event.payload.kind !== 'decision.outcome') continue;
+        const { decisions, kind: _, ...observed } = event.payload;
+        for (const item of decisions) if (!outcomes.has(item.decisionId)) outcomes.set(item.decisionId, { ...observed, additionalTimeMs: item.additionalTimeMs });
+      }
+      return events.flatMap(({ event }) => {
+        if (event.payload.kind !== 'decision.recorded') return [];
+        const { kind: _, features, ...decision } = event.payload;
+        return [{ sessionId: id, at: event.at, ...decision, stateFeatures: features, observedOutcome: outcomes.get(decision.decisionId) ?? null }];
+      });
+    });
+  }
+
+  /** Records the phase the controller derives after a checkpoint, so phases replay from events. */
+  #sync(sessionId: string, cause: string): void {
+    if (this.#readOnly) return;
+    this.#measure(sessionId, 'phase', () => {
+      const stored = this.#store.get(sessionId);
+      const state = this.#current(stored);
+      const next = this.#action(state);
+      const to = phaseFor(state, next);
+      if (to !== stored.phase) this.#transition(sessionId, to, cause);
+      this.#record(sessionId, { ...state, phase: to }, next);
+    });
+  }
+
   /** Without explicit checks, the project's user-approved checks cover every requirement of the new goal. */
-  start(input: { request: string; checks?: unknown; replace?: boolean }): SessionState {
+  /**
+   * Without explicit checks, the project's user-approved checks cover every requirement of the new goal.
+   * `agent` marks the agent-reachable CLI path: in a managed project its goal must keep the latest captured prompt verbatim.
+   */
+  start(input: { request: string; checks?: unknown; replace?: boolean; agent?: boolean }): SessionState {
+    return this.#begin(input, null);
+  }
+
+  /** Decision 2/3: the latest captured prompt becomes R1 verbatim, accepted by the approved project checks. Idempotent per prompt. */
+  startFromPrompt(promptId: string): { session: SessionState; created: boolean } {
+    const id = /^(prompt|run):/.test(promptId) ? promptId : `prompt:${promptId}`;
+    const existing = this.#store.sessionForPrompt(id);
+    if (existing) {
+      const config = readProjectConfig(this.projectRoot);
+      // Work after a verified task under the same prompt reopens that task instead of starting a new one.
+      if (config?.enabled && config.activeSessionId === null && this.next(existing).kind !== 'complete') {
+        writeProjectConfig(this.projectRoot, { ...config, activeSessionId: existing });
+      }
+      return { session: this.get(existing), created: false };
+    }
+    const prompt = capturedPrompts(this.projectRoot, id.startsWith('run:')).find(item => item.id === id);
+    if (!prompt) throw new Error('Unknown hook-captured user prompt');
+    const session = this.#begin({ request: prompt.text }, prompt);
+    try {
+      this.retrieve(session.id);
+    } catch {
+      // The session stays at context-check; the next checkpoint retries retrieval.
+    }
+    return { session: this.get(session.id), created: true };
+  }
+
+  #begin(input: { request: string; checks?: unknown; replace?: boolean; agent?: boolean }, prompt: UserDecision | null): SessionState {
     const id = `session-${randomUUID()}`;
     const config = readProjectConfig(this.projectRoot);
     const enabled = config?.enabled === true ? config : null;
@@ -99,9 +216,35 @@ export class Runtime {
       if (!input.replace) throw new Error(`Active session ${active} is not complete; pass --replace to start another`);
       replaced = active;
     }
+    // A controller-started contract keeps the user's R1 verbatim through every agent-initiated replacement.
+    let kept: { statement: string; origin: NonNullable<SessionState['origin']> } | null = null;
+    if (replaced) {
+      let old: SessionState;
+      try {
+        old = this.#store.get(replaced);
+      } catch (error) {
+        // An unreadable session cannot show that its R1 is safe to drop.
+        throw new Error(`Cannot replace unreadable session ${replaced}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+      const statement = old.goal.requirements[0]?.statement;
+      if (old.origin && statement !== undefined) kept = { statement, origin: old.origin };
+    }
+    // N3: in a managed project an agent-started contract must carry the user's latest prompt verbatim.
+    let latestPrompt: string | null = null;
+    if (input.agent === true && !prompt && !kept && enabled?.checks.length) {
+      latestPrompt = capturedPrompts(this.projectRoot).findLast(item => !/^approve\s+check\s+[0-9a-f]{4}$/i.test(item.text))?.text ?? null;
+    }
     for (const check of enabled?.checks ?? []) assertSafeArgv(check.argv);
     const started = this.#measure(id, 'start', () => {
-      const goal = extractGoal(nonempty(input.request, 'request'));
+      const goal: Goal = prompt
+        ? { version: 1, request: prompt.text, requirements: [{ id: 'R1', statement: prompt.text, acceptance: projectChecksAcceptance, acceptanceSource: 'project-checks', sourceLine: 1 }], uncertainties: [] }
+        : extractGoal(nonempty(input.request, 'request'));
+      if (latestPrompt !== null && !goal.requirements.some(item => item.statement === latestPrompt)) {
+        throw new Error(`This managed project has a captured user prompt; a contract must keep it verbatim as a requirement statement (or let the controller start it on the first edit): ${latestPrompt.slice(0, 500)}`);
+      }
+      if (kept && !goal.requirements.some(item => item.statement === kept.statement)) {
+        throw new Error(`Session ${replaced} was started by the controller from the user's prompt; a replacement must keep its R1 verbatim as a requirement statement: ${kept.statement.slice(0, 500)}`);
+      }
       const checks = input.checks === undefined
         ? (enabled?.checks ?? []).map(check => ({ ...check, requirementIds: goal.requirements.map(requirement => requirement.id) }))
         : parseChecks(input.checks).map(check => registerArtifacts(this.projectRoot, check));
@@ -112,7 +255,7 @@ export class Runtime {
         if (check.requirementIds.some(id => !goal.requirements.some(item => item.id === id))) throw new Error('Check references unknown requirement');
       }
       const state: SessionState = {
-        id, goal, checks, decisions: [], context: null, assessment: null, review: { kind: 'pending' },
+        id, ...(prompt ? { origin: { promptId: prompt.id } } : kept ? { origin: kept.origin } : {}), goal, checks, decisions: prompt ? [prompt] : [], context: null, assessment: null, review: { kind: 'pending' },
         control: { kind: 'running', rounds: 0 }, evidence: [],
         failureStreak: { signature: '', count: 0 }, completionClaimed: false,
       };
@@ -127,6 +270,8 @@ export class Runtime {
       }
     }
     if (enabled) writeProjectConfig(this.projectRoot, { ...enabled, activeSessionId: id });
+    if (!this.#readOnly) this.#transition(id, 'requested', prompt ? 'controller-started' : 'session.started');
+    this.#sync(id, 'goal.extracted');
     return started;
   }
 
@@ -136,11 +281,7 @@ export class Runtime {
 
   next(sessionId: string) {
     return this.#measure(sessionId, 'next', () => {
-      const state = this.#current(this.#store.get(sessionId));
-      if (state.checks.some(check => !artifactsCurrent(check))) {
-        return { kind: 'escalate', route: 'human', reason: 'Registered verifier artifacts changed; an operator must register a new contract.' } as const;
-      }
-      const action = nextAction(state);
+      const action = this.#action(this.#current(this.#store.get(sessionId)));
       if (action.kind === 'complete' && !this.#readOnly) {
         // A verified session releases the pointer, so hooks take the no-spawn path again.
         const config = readProjectConfig(this.projectRoot);
@@ -151,28 +292,34 @@ export class Runtime {
   }
 
   importHistory(sessionId: string, path: string): SessionState {
-    return this.#measure(sessionId, 'import-history', () => {
+    const state = this.#measure(sessionId, 'import-history', () => {
       const decisions = importConversation(this.projectRoot, path);
       return this.#store.update(sessionId, () => ({ kind: 'conversation.imported', decisions }));
     });
+    this.#sync(sessionId, 'conversation.imported');
+    return state;
   }
 
   retrieve(sessionId: string) {
-    return this.#measure(sessionId, 'retrieve', () => {
+    const context = this.#measure(sessionId, 'retrieve', () => {
       const state = this.#store.update(sessionId, current => ({ kind: 'context.retrieved', context: retrieveContext(this.projectRoot, current.goal, current.decisions) }));
       if (!state.context) throw new Error('Context retrieval did not produce a snapshot');
       return state.context;
     });
+    this.#sync(sessionId, 'context.retrieved');
+    return context;
   }
 
   assess(sessionId: string, input: ContextAssessment): SessionState {
     const assessment = parseAssessment(input);
-    return this.#measure(sessionId, 'assess', () => this.#store.update(sessionId, stored => {
+    const state = this.#measure(sessionId, 'assess', () => this.#store.update(sessionId, stored => {
       const state = this.#current(stored);
       if (!state.context) throw new Error('Retrieve current context before assessment');
       if (assessment.itemIds.some(id => !state.context?.items.some(item => item.id === id))) throw new Error('Assessment cites unknown context');
       return { kind: 'context.assessed', assessment };
     }));
+    this.#sync(sessionId, 'context.assessed');
+    return state;
   }
 
   resolve(sessionId: string, input: { uncertaintyId: string; source: string; answer?: string }): SessionState {
@@ -185,7 +332,7 @@ export class Runtime {
         this.#measure(sessionId, 'import-prompt', () => this.#store.update(sessionId, () => ({ kind: 'conversation.imported', decisions: [decision] })));
       }
     }
-    return this.#measure(sessionId, 'resolve', () => this.#store.update(sessionId, stored => {
+    const resolved = this.#measure(sessionId, 'resolve', () => this.#store.update(sessionId, stored => {
       const question = stored.goal.uncertainties.find(item => item.id === input.uncertaintyId);
       if (!question) throw new Error('Unknown uncertainty');
       let answer: string;
@@ -193,6 +340,7 @@ export class Runtime {
         const superseded = new Set(stored.decisions.flatMap(item => item.supersedes));
         const decision = stored.decisions.find(item => item.id === input.source && !superseded.has(item.id));
         if (!decision) throw new Error('Human uncertainty requires an active imported user decision');
+        if (decision.id.startsWith('run:')) throw new Error('A managed-run request carries no human authority; the user must answer in a captured prompt');
         const actual = sourceDecisions(this.projectRoot, decision.source);
         if (!actual.some(item => item.id === decision.id && item.digest === decision.digest)) throw new Error('Human decision source is stale');
         answer = decision.text;
@@ -203,11 +351,13 @@ export class Runtime {
       }
       return { kind: 'uncertainty.resolved', uncertaintyId: question.id, answer, source: input.source };
     }));
+    this.#sync(sessionId, 'uncertainty.resolved');
+    return resolved;
   }
 
   review(sessionId: string, input: ReviewResponse): SessionState {
     const response = parseReviewResponse(input);
-    return this.#measure(sessionId, 'review', () => this.#store.update(sessionId, stored => {
+    const reviewed = this.#measure(sessionId, 'review', () => this.#store.update(sessionId, stored => {
       const state = this.#current(stored);
       if (state.control.kind !== 'running') throw new Error(`Execution is ${state.control.kind}; resolve cooperative control first`);
       if (response.goalVersion !== state.goal.version) throw new Error('Review references a stale goal version');
@@ -229,10 +379,12 @@ export class Runtime {
       if (challenges.length >= 2) return { kind: 'contract.escalated', reason: 'Contract review challenge budget exhausted; a human decision is required.', review: response };
       return { kind: 'contract.reviewed', review: { ...response, kind: 'challenged', uncertaintyId: `review:${challenges.length + 1}` } };
     }));
+    this.#sync(sessionId, 'contract.reviewed');
+    return reviewed;
   }
 
   runCheck(sessionId: string, checkId: string): VerificationEvidence {
-    return this.#measure(sessionId, 'check', timing => this.#store.commit(sessionId, stored => {
+    const observed = this.#measure(sessionId, 'check', timing => this.#store.commit(sessionId, stored => {
       const state = this.#current(stored);
       if (state.control.kind !== 'running') throw new Error(`Execution is ${state.control.kind}; resolve cooperative control first`);
       const gate = assessGate(state);
@@ -266,19 +418,84 @@ export class Runtime {
       }
       return { payload: { kind: 'command.observed', evidence, control, failureStreak }, value: evidence };
     }).value);
+    this.#sync(sessionId, 'command.observed');
+    return observed;
   }
 
   reconsider(sessionId: string, input: { strategy: 'retain' | 'revise'; rationale: string }): SessionState {
     const rationale = nonempty(input.rationale, 'rationale');
-    return this.#measure(sessionId, 'reconsider', () => this.#store.update(sessionId, state => {
+    const state = this.#measure(sessionId, 'reconsider', () => this.#store.update(sessionId, state => {
       if (state.control.kind !== 'paused') throw new Error('A strategy response requires a paused session');
       if (input.strategy !== 'retain' && input.strategy !== 'revise') throw new Error('Unknown strategy response');
       return { kind: 'strategy.resolved', strategy: input.strategy, rationale, control: { kind: 'running', rounds: state.control.rounds } };
     }));
+    this.#sync(sessionId, 'strategy.resolved');
+    return state;
   }
 
   claim(sessionId: string): SessionState {
-    return this.#measure(sessionId, 'claim', () => this.#store.update(sessionId, () => ({ kind: 'completion.claimed' })));
+    const state = this.#measure(sessionId, 'claim', () => this.#store.update(sessionId, () => ({ kind: 'completion.claimed' })));
+    this.#sync(sessionId, 'completion.claimed');
+    return state;
+  }
+
+  /** The authoritative structured decision for a session. */
+  decide(sessionId: string): Decision & { sessionId: string; action: NextAction } {
+    return this.#measure(sessionId, 'decide', () => {
+      const state = this.#current(this.#store.get(sessionId));
+      const action = this.#action(state);
+      return { sessionId, ...decide(state, action), action };
+    });
+  }
+
+  /** Decision 6: an exhausted Stop budget is recorded as blocked, never as a stop with the task complete. */
+  block(sessionId: string, cause: string): Decision & { sessionId: string; action: NextAction } {
+    const reason = nonempty(cause, 'reason');
+    this.#measure(sessionId, 'block', () => {
+      if (this.#store.get(sessionId).phase !== 'blocked') this.#transition(sessionId, 'blocked', reason);
+    });
+    return this.decide(sessionId);
+  }
+
+  /** A protected action in a managed project: start the contract if none is open, then evaluate against it. */
+  gate(action: GateAction, activeSessionId: string | null) {
+    let sessionId = activeSessionId;
+    let started = false;
+    if (!sessionId) {
+      const prompt = capturedPrompts(this.projectRoot).findLast(item => !/^approve\s+check\s+[0-9a-f]{4}$/i.test(item.text));
+      if (!prompt) return { allow: false, decision: 'BLOCK_ACTION' as const, reason: 'Managed project without a captured user prompt to start a contract from; start one with `optimizer start`.', sessionId: null, started };
+      const result = this.startFromPrompt(prompt.id);
+      sessionId = result.session.id;
+      started = result.created;
+    }
+    const id = sessionId;
+    return this.#measure(id, 'gate', () => {
+      const stored = this.#store.get(id);
+      let state = this.#current(stored);
+      let next = this.#action(state);
+      let checkpoint = decide(state, next);
+      // Edits make the reviewed snapshot stale by design; while executing they continue under it, and verify requires fresh context.
+      if ((stored.phase === 'executing' || stored.phase === 'recovery') && (checkpoint.decision === 'RETRIEVE_CONTEXT' || checkpoint.decision === 'INVESTIGATE')) {
+        const trusted = this.#current(stored, true);
+        const trustedNext = this.#action(trusted);
+        if (trustedNext.kind === 'execute' || trustedNext.kind === 'verify') {
+          state = trusted;
+          next = trustedNext;
+          checkpoint = decide(state, next);
+        }
+      }
+      const verdict = evaluate(state, action, { managed: true, available: true, next });
+      const reopen = verdict.allow && checkpoint.decision === 'COMPLETE';
+      if (reopen) {
+        // Work after verification reopens the task: the pointer comes back, so Stop and the gate track it until it verifies again.
+        const config = readProjectConfig(this.projectRoot);
+        if (config?.enabled && config.activeSessionId !== id) writeProjectConfig(this.projectRoot, { ...config, activeSessionId: id });
+      }
+      const executing = verdict.allow && (checkpoint.phase === 'ready' || reopen) && state.phase !== 'executing';
+      if (executing) this.#transition(id, 'executing', reopen ? `tool-after-verification:${action.tool}` : `tool:${action.tool}`);
+      this.#record(id, executing ? { ...state, phase: 'executing' } : state, next);
+      return { ...verdict, sessionId: id, started, checkpoint };
+    });
   }
 
   verify(sessionId: string) {
@@ -288,13 +505,52 @@ export class Runtime {
       if (action.kind !== 'execute' && action.kind !== 'verify' && action.kind !== 'complete') break;
       this.runCheck(sessionId, check.id);
     }
+    this.#sync(sessionId, 'verify');
     const current = this.get(sessionId);
     const action = this.next(sessionId);
-    return { action, verifiedRequirementIds: verifiedRequirementIds(current), evidence: current.evidence };
+    const outcome = verificationOutcome(current, action);
+    if (!this.#readOnly) this.#backfill(sessionId, outcome, current);
+    return { action, outcome, phase: this.#store.get(sessionId).phase ?? phaseFor(current, action), verifiedRequirementIds: verifiedRequirementIds(current), evidence: current.evidence };
   }
 
   events(sessionId: string) { return this.#store.events(sessionId); }
   sessions(): string[] { return this.#store.sessionIds(); }
   measurements(sessionId: string): Measurement[] { return this.#store.measurements(sessionId); }
   close(): void { this.#store.close(); }
+}
+
+/**
+ * Policy gate for one host tool call. Reads, control commands and unmanaged projects never open the
+ * runtime store, so they start no session; a runtime failure inside a managed task fails closed.
+ */
+export function gate(projectRoot: string, tool: string, input: Record<string, unknown>) {
+  let config: ProjectConfig | null = null;
+  try {
+    config = readProjectConfig(projectRoot);
+  } catch {
+    // An unreadable record cannot show an active task; the evaluation below fails open.
+  }
+  const managed = managedProject(config, process.env.OPTIMIZER_MODE);
+  const active = config?.activeSessionId ?? null;
+  let action: GateAction = { kind: 'protected', tool };
+  let runtime: Runtime | null = null;
+  try {
+    const root = canonicalRoot(projectRoot);
+    const cwd = typeof input.cwd === 'string' && isAbsolute(input.cwd) ? input.cwd : root;
+    // A root shaped like a bare repository (committed HEAD and objects without .git) would hand git its config.
+    const gitSafe = existsSync(join(root, '.git')) || !(existsSync(join(root, 'HEAD')) && existsSync(join(root, 'objects')));
+    const classified = classifyTool(tool, input, config?.enabled ? config.checks.map(check => check.argv) : [], { root, cwd, gitSafe });
+    action = classified.target !== undefined && tool !== 'Bash' ? { ...classified, target: resolve(root, classified.target) } : classified;
+    if (action.kind !== 'protected' || !managed || reservedAction(action)) {
+      return { ...evaluate(null, action, { managed, available: true }), sessionId: active, started: false, action };
+    }
+    runtime = new Runtime(projectRoot);
+    return { ...runtime.gate(action, active), action };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // In a managed project a failure denies protected actions even before a task starts; elsewhere it fails open.
+    return { ...evaluate(null, action, { managed, available: false, active: active !== null || managed }), sessionId: active, started: false, action, error: message };
+  } finally {
+    runtime?.close();
+  }
 }

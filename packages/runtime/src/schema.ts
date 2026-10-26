@@ -8,7 +8,7 @@ const resolution = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('open') }).strict(),
   z.object({ kind: z.literal('resolved'), answer: text, source: text }).strict(),
 ]);
-const requirement = z.object({ id, statement: text, acceptance: z.string(), sourceLine: z.number().int().positive() }).strict();
+const requirement = z.object({ id, statement: text, acceptance: z.string(), acceptanceSource: z.literal('project-checks').optional(), sourceLine: z.number().int().positive() }).strict();
 const uncertainty = z.object({ id, question: text, owner: z.enum(['human', 'local']), critical: z.boolean(), resolution }).strict();
 const goal = z.object({ version: z.number().int().positive().default(1), request: text, requirements: z.array(requirement).min(1), uncertainties: z.array(uncertainty) }).strict();
 const reviewFields = { goalVersion: z.number().int().positive(), rationale: text, itemIds: z.array(id).min(1) };
@@ -51,8 +51,21 @@ const result = z.object({
 }).strict();
 const evidence = z.object({ checkId: id, requirementIds: z.array(id), projectDigest: text, result, at: timestamp }).strict();
 const streak = z.object({ signature: z.string(), count: z.number().int().nonnegative() }).strict();
+const phase = z.enum(['requested', 'contract-proposed', 'under-review', 'context-check', 'ready', 'executing', 'reconsidering', 'verifying', 'verified', 'recovery', 'blocked']);
+const decisionKind = z.enum(['PROCEED', 'RETRIEVE_CONTEXT', 'INVESTIGATE', 'ASK_HUMAN', 'REVIEW_CONTRACT', 'RUN_VERIFICATION', 'REQUEST_RECONSIDERATION', 'BLOCK_ACTION', 'COMPLETE']);
+const count = z.number().int().nonnegative();
+const features = z.object({
+  phase, requirements: count, openHumanQuestions: count, openLocalQuestions: count, contextComplete: z.boolean().nullable(), uncoveredRequirements: count,
+  reviewState: z.enum(['pending', 'accepted', 'challenged']), control: z.enum(['running', 'paused', 'escalated']), failureStreak: count,
+  reconsiderationRounds: count, checks: count, lastCheckOutcome: z.enum(['passed', 'failed', 'timeout', 'spawn-error', 'output-limit']).nullable(),
+  msSinceStart: z.number().nonnegative(), events: count,
+}).strict();
+const ranked = z.object({
+  action: decisionKind, successProbability: z.number().min(0).max(1), expectedCostMs: z.number().nonnegative().optional(),
+  expectedTokens: z.number().nonnegative().optional(), rationale: text,
+}).strict();
 const state = z.object({
-  id, goal, checks: z.array(checkSchema), decisions: z.array(decision), context: context.nullable(), assessment: assessment.nullable(),
+  id, phase: phase.optional(), origin: z.object({ promptId: id }).strict().optional(), goal, checks: z.array(checkSchema), decisions: z.array(decision), context: context.nullable(), assessment: assessment.nullable(),
   review: contractReview.default({ kind: 'pending' }),
   control, evidence: z.array(evidence), failureStreak: streak, completionClaimed: z.boolean(),
 }).strict();
@@ -68,6 +81,16 @@ const payload = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('strategy.resolved'), rationale: text, strategy: z.enum(['retain', 'revise']), control }).strict(),
   z.object({ kind: z.literal('completion.claimed') }).strict(),
   z.object({ kind: z.literal('session.replaced'), replacedBy: id }).strict(),
+  z.object({ kind: z.literal('workflow.transitioned'), from: phase.nullable(), to: phase, cause: text }).strict(),
+  z.object({
+    kind: z.literal('decision.recorded'), decisionId: id, features, availableActions: z.array(decisionKind).min(1), chosenAction: decisionKind,
+    decisionModelVersion: id, shadow: z.object({ version: id, ranking: z.array(ranked) }).strict().optional(),
+  }).strict(),
+  z.object({
+    kind: z.literal('decision.outcome'), outcome: z.enum(['VERIFIED', 'FAILED', 'INCONCLUSIVE', 'NEEDS_HUMAN_REVIEW', 'BLOCKED']),
+    verificationProgress: z.object({ verified: count, total: count }).strict(), goalSatisfied: z.boolean(), additionalTokens: z.null(),
+    decisions: z.array(z.object({ decisionId: id, additionalTimeMs: z.number().nonnegative() }).strict()).min(1),
+  }).strict(),
 ]);
 const event = z.object({ version: z.literal(1), id, sessionId: id, producer: id, at: timestamp, payload }).strict();
 
@@ -75,6 +98,8 @@ const projectConfig = z.object({
   projectRoot: z.string().min(1).max(4096), enabled: z.boolean(), hookToken: z.string().regex(/^[0-9a-f]{64}$/), checks: z.array(checkSchema).max(100), activeSessionId: id.nullable(),
   // Proposed by the agent; activated only by a hook-captured user prompt quoting the code.
   pendingChecks: z.object({ code: z.string().regex(/^[0-9a-f]{4}$/), checks: z.array(checkDefinition).min(1).max(100) }).strict().nullable().default(null),
+  // A non-interactive enable/disable waits here until a hook-captured user prompt quotes `approve KIND CODE`.
+  pendingChange: z.object({ code: z.string().regex(/^[0-9a-f]{4}$/), kind: z.enum(['enable', 'disable']), checks: z.array(checkDefinition).max(100).nullable() }).strict().nullable().default(null),
   // Set only by the user's `optimizer enable`; opt-in hooks ignore records that always-on hooks created on first use.
   optedIn: z.literal(true).optional(),
 }).strict();

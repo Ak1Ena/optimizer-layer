@@ -51,7 +51,13 @@ export function reduceEvent(state: SessionState | null, event: Event): SessionSt
     case 'command.observed': return { ...state, evidence: [...state.evidence, payload.evidence], control: payload.control, failureStreak: payload.failureStreak };
     case 'strategy.resolved': return { ...state, control: payload.control, failureStreak: { signature: '', count: 0 }, completionClaimed: false };
     case 'completion.claimed': return { ...state, completionClaimed: true };
-    case 'session.replaced': return state;
+    case 'session.replaced':
+    case 'decision.recorded':
+    case 'decision.outcome': return state;
+    case 'workflow.transitioned': {
+      if ((state.phase ?? null) !== payload.from) throw new Error('Workflow transition from a stale phase');
+      return { ...state, phase: payload.to };
+    }
     default: { const exhaustive: never = payload; return exhaustive; }
   }
 }
@@ -172,6 +178,12 @@ export class Store {
       const input: unknown = JSON.parse(row.body);
       return { sequence: row.sequence, event: parseEvent(input) };
     });
+  }
+
+  /** The session a controller started from this captured prompt, if any. */
+  sessionForPrompt(promptId: string): string | null {
+    const row = this.#db.prepare("SELECT session_id FROM events WHERE json_extract(body, '$.payload.kind')='session.started' AND json_extract(body, '$.payload.state.origin.promptId')=? ORDER BY sequence DESC LIMIT 1").get(promptId);
+    return row ? String(row.session_id) : null;
   }
 
   /** Session IDs, most recently started first. */

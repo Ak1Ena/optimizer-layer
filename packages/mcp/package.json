@@ -1,6 +1,6 @@
 {
   "name": "@optimizer-layer/mcp",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Read-only MCP views for a project-local optimizer runtime",
   "type": "module",
   "engines": {
@@ -15,7 +15,7 @@
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1",
-    "@optimizer-layer/runtime": "0.2.1",
+    "@optimizer-layer/runtime": "0.3.0",
     "zod": "4.6.5"
   },
   "license": "MIT",

@@ -1,10 +1,14 @@
 import type { ContractReview, ReviewResponse } from './schema.ts';
+import type { DecisionKind, VerificationOutcome } from './controller.ts';
+import type { DecisionAction, RankedAction, StateFeatures } from './decision-model.ts';
 export type { ContractReview, ReviewResponse } from './schema.ts';
 
 export interface Requirement {
   id: string;
   statement: string;
   acceptance: string;
+  /** Set when the acceptance is the controller default rather than user dialect text. */
+  acceptanceSource?: 'project-checks' | undefined;
   sourceLine: number;
 }
 export type Resolution = { kind: 'open' } | { kind: 'resolved'; answer: string; source: string };
@@ -83,8 +87,15 @@ export type Control =
   | { kind: 'running'; rounds: number }
   | { kind: 'paused'; rounds: number; reason: string }
   | { kind: 'escalated'; rounds: number; reason: string };
+export type Phase =
+  | 'requested' | 'contract-proposed' | 'under-review' | 'context-check' | 'ready' | 'executing'
+  | 'reconsidering' | 'verifying' | 'verified' | 'recovery' | 'blocked';
 export interface SessionState {
   id: string;
+  /** Last recorded workflow phase; absent in sessions persisted before phases existed. */
+  phase?: Phase | undefined;
+  /** Controller-started sessions record the hook-captured prompt they came from. */
+  origin?: { promptId: string } | undefined;
   goal: Goal;
   checks: Check[];
   decisions: Decision[];
@@ -116,7 +127,16 @@ export type EventPayload =
   | { kind: 'command.observed'; evidence: VerificationEvidence; control: Control; failureStreak: SessionState['failureStreak'] }
   | { kind: 'strategy.resolved'; rationale: string; strategy: 'retain' | 'revise'; control: Control }
   | { kind: 'completion.claimed' }
-  | { kind: 'session.replaced'; replacedBy: string };
+  | { kind: 'session.replaced'; replacedBy: string }
+  | { kind: 'workflow.transitioned'; from: Phase | null; to: Phase; cause: string }
+  | {
+    kind: 'decision.recorded'; decisionId: string; features: StateFeatures; availableActions: DecisionAction[]; chosenAction: DecisionKind;
+    decisionModelVersion: string; shadow?: { version: string; ranking: RankedAction[] } | undefined;
+  }
+  | {
+    kind: 'decision.outcome'; outcome: VerificationOutcome | 'BLOCKED'; verificationProgress: { verified: number; total: number };
+    goalSatisfied: boolean; additionalTokens: null; decisions: { decisionId: string; additionalTimeMs: number }[];
+  };
 export interface Event {
   version: 1;
   id: string;

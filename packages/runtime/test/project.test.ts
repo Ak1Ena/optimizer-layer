@@ -79,7 +79,7 @@ test('the first prompt capture lazily creates private state, the hook token and 
   const config = readProjectConfig(project);
   assert.ok(config);
   assert.match(config.hookToken, /^[0-9a-f]{64}$/);
-  assert.deepEqual({ ...config, hookToken: 'T' }, { projectRoot: project, enabled: true, hookToken: 'T', checks: [], activeSessionId: null, pendingChecks: null });
+  assert.deepEqual({ ...config, hookToken: 'T' }, { projectRoot: project, enabled: true, hookToken: 'T', checks: [], activeSessionId: null, pendingChecks: null, pendingChange: null });
   assert.equal(statSync(join(project, '.optimizer')).mode & 0o777, 0o700);
   assert.equal(statSync(configPath(project)).mode & 0o777, 0o600);
   assert.ok(configPath(project).startsWith(join(home, 'config', 'optimizer-layer', 'projects')));
@@ -258,8 +258,9 @@ test('start uses project checks, sets the active session and requires --replace 
   database.prepare('UPDATE events SET body=? WHERE session_id=?').run('{}', second.id);
   database.close();
   assert.throws(() => runtime.start({ request: goal }), /--replace/);
-  const third = runtime.start({ request: goal, replace: true });
-  assert.equal(readProjectConfig(project)?.activeSessionId, third.id);
+  // An unreadable session cannot show its R1 is safe to drop, so replacing it fails closed.
+  assert.throws(() => runtime.start({ request: goal, replace: true }), /Cannot replace unreadable session/);
+  assert.equal(readProjectConfig(project)?.activeSessionId, second.id);
 });
 
 test('current reports enablement and a bounded session summary', (t) => {
@@ -269,7 +270,7 @@ test('current reports enablement and a bounded session summary', (t) => {
     assert.equal(result.status, 0, result.stderr);
     return JSON.parse(result.stdout) as unknown;
   };
-  const idle = { enabled: true, checks: [], pendingChecks: null, sessionId: null, action: null, summary: 'No active optimizer session.' };
+  const idle = { enabled: true, checks: [], pendingChecks: null, sessionId: null, action: null, phase: null, checkpoint: null, summary: 'No active optimizer session.' };
   assert.deepEqual(current(), idle);
   assert.equal(existsSync(join(project, '.optimizer')), false);
   const proposal = proposeChecks(project, { commands: [`node ${checker}`], timeoutMs: 1000 });
@@ -363,4 +364,37 @@ test('the runtime refuses planted symlinks for its database companions', (t) => 
   symlinkSync(victim, join(project, '.optimizer', 'runtime.sqlite-wal'));
   assert.throws(() => new Runtime(project), /symlink/);
   assert.equal(readFileSync(victim, 'utf8'), 'keep');
+});
+
+test('enable and disable from a non-interactive process only create a request that a captured user prompt approves', (t) => {
+  const { project, checker } = setup(t);
+  enableProject(project, { commands: [`node ${checker}`], timeoutMs: 1000, yes: false });
+  const hookToken = token(project);
+  const before = readProjectConfig(project);
+  const run = (...args: string[]) => {
+    // Pipes, like Claude Code's Bash tool and `!` commands: no terminal, so no user proof.
+    const result = spawnSync(process.execPath, [cli, ...args, '--project', project], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+    assert.equal(result.status, 0, result.stderr);
+    return JSON.parse(result.stdout) as { pending: string; code: string; approval: string };
+  };
+  const disable = run('disable');
+  assert.equal(disable.pending, 'disable');
+  assert.match(disable.approval, /^approve disable [0-9a-f]{4}$/);
+  assert.equal(readProjectConfig(project)?.enabled, true, 'nothing applied yet');
+  const wrong = disable.code === '0000' ? '0001' : '0000';
+  assert.equal('changeApproved' in capturePrompt(project, `approve disable ${wrong}`, hookToken), false);
+  assert.equal(readProjectConfig(project)?.enabled, true, 'a wrong code applies nothing');
+  assert.throws(() => capturePrompt(project, disable.approval, 'not-the-token'), /hook token/);
+  assert.equal(capturePrompt(project, `ok, ${disable.approval}`, hookToken).changeApproved, 'disable');
+  assert.equal(readProjectConfig(project)?.enabled, false);
+  const enable = run('enable', '--check', `node ${checker} other`);
+  assert.equal(enable.pending, 'enable');
+  assert.equal(readProjectConfig(project)?.enabled, false);
+  assert.deepEqual(readProjectConfig(project)?.checks, before?.checks, 'approved checks are unchanged until the user approves');
+  assert.throws(() => capturePrompt(project, 'hello', hookToken), /disabled/);
+  assert.equal(capturePrompt(project, enable.approval.toUpperCase(), hookToken).changeApproved, 'enable');
+  const after = readProjectConfig(project);
+  assert.equal(after?.enabled, true);
+  assert.deepEqual(after?.checks[0]?.argv.slice(1), [checker, 'other']);
+  assert.equal(after?.pendingChange, null);
 });
