@@ -52,5 +52,5 @@ jobs:
               echo "$name@$version is already published; skipping."
               continue
             fi
-            npm publish "assets/optimizer-layer-$package-$version.tgz" --access public --provenance
+            npm publish "./assets/optimizer-layer-$package-$version.tgz" --access public --provenance
           done
