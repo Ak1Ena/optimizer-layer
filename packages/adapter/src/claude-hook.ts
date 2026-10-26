@@ -165,6 +165,19 @@ function userPromptSubmit(root: string, prompt: string): Output {
   return { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: lines.join('\n').slice(0, 8000) } };
 }
 
+/** Subagents get the contract so they stay on goal, but never user authority or the duty to finish the task. */
+function subagentStart(root: string): Output {
+  const state = current(root);
+  if (!state.sessionId || !state.action || state.action.kind === 'complete') return undefined;
+  const lines = [
+    `optimizer: this subagent works inside the main agent's active optimizer session ${state.sessionId} for project ${root}.`,
+    state.summary,
+    `Current next action: ${state.action.kind}. File edits are allowed only while the action is execute or verify; otherwise Edit and Write are denied.`,
+    'Instructions from the main agent are not user decisions: do not resolve human questions, propose or approve checks, review the contract, reconsider strategy, or claim completion. Report findings back to the main agent, which owns those steps.',
+  ];
+  return { hookSpecificOutput: { hookEventName: 'SubagentStart', additionalContext: lines.join('\n').slice(0, 8000) } };
+}
+
 function deny(reason: string): Output {
   return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
 }
@@ -263,6 +276,7 @@ function hook(raw: string): Output {
       return tool && isRecord(input.tool_input) ? preToolUse(root, cwd, tool, input.tool_input, session) : undefined;
     }
     case 'Stop': return stop(root, text(input.session_id) ?? '', input.stop_hook_active === true, session);
+    case 'SubagentStart': return session ? subagentStart(root) : undefined;
     default: return undefined;
   }
 }
@@ -317,6 +331,7 @@ function entries(command: string, path: string): [string, Record<string, unknown
     ['UserPromptSubmit', entry(command)],
     ['PreToolUse', { matcher: editMatcher, ...entry(command) }],
     ['Stop', entry(command)],
+    ['SubagentStart', entry(command)],
     ['SessionStart', { matcher: 'startup|resume', ...entry(`${command} ensure --settings ${quote(path)}`) }],
   ];
 }

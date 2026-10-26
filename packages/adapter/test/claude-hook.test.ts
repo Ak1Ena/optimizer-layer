@@ -153,12 +153,15 @@ test('hooks capture prompts, approve checks by code, gate edits by contract acti
   }
   assert.equal(hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } }).output, undefined);
   assert.equal(hook({ hook_event_name: 'Stop' }).output, undefined);
+  assert.equal(hook({ hook_event_name: 'SubagentStart', agent_id: 'a0', agent_type: 'Explore' }).output, undefined, 'no session, no subagent context');
 
   const draft = join(project, '.optimizer', 'drafts', 'goal.md');
   mkdirSync(join(project, '.optimizer', 'drafts'));
   writeFileSync(draft, '- R1: greeting returns a personalized greeting.\nAcceptance R1: greeting of Ada returns Hello Ada.\nQuestion human Q1: Which greeting language is required?\n');
   const sessionId = field(optimizer('start', '--request', draft), 'id');
   assert.ok(typeof sessionId === 'string');
+  const subagent = String(field(hook({ hook_event_name: 'SubagentStart', agent_id: 'a1', agent_type: 'Explore' }).output, 'hookSpecificOutput', 'additionalContext'));
+  assert.match(subagent, new RegExp(`active optimizer session ${sessionId}[\\s\\S]*R1[\\s\\S]*Current next action: clarify[\\s\\S]*not user decisions`));
   const clarifyReason = 'Critical human decisions need answers with source references';
   const denied = hook(edit(join(project, 'greeting.mjs'))).output;
   assert.match(String(field(denied, 'hookSpecificOutput', 'permissionDecisionReason')), new RegExp(`^optimizer: clarify: ${clarifyReason}`));
@@ -264,6 +267,7 @@ test('installer merges idempotently, keeps unrelated settings and uninstalls onl
       SessionStart: [...original.hooks.SessionStart, { matcher: 'startup|resume', hooks: [{ type: 'command', command: `${command} ensure --settings '${settings}'` }] }],
       UserPromptSubmit: [ours],
       Stop: [ours],
+      SubagentStart: [ours],
     },
   };
   assert.deepEqual(install(), expected);
@@ -279,6 +283,10 @@ test('installer merges idempotently, keeps unrelated settings and uninstalls onl
   assert.equal(readFileSync(settings, 'utf8'), installed, 'intact entries are left byte-for-byte');
   writeFileSync(settings, JSON.stringify({ ...expected, hooks: { ...expected.hooks, Stop: [] } }));
   assert.match(ensure(), /repaired/);
+  const { SubagentStart: _, ...olderInstall } = expected.hooks;
+  writeFileSync(settings, JSON.stringify({ ...expected, hooks: olderInstall }));
+  assert.match(ensure(), /repaired/, 'an install from before SubagentStart existed is upgraded');
+  assert.deepEqual(JSON.parse(readFileSync(settings, 'utf8')), expected);
   assert.deepEqual(JSON.parse(readFileSync(settings, 'utf8')), expected);
   const moved = JSON.parse(installed.replaceAll(hookScript, '/old/place/dist/claude-hook.js')) as unknown;
   writeFileSync(settings, JSON.stringify(moved));
