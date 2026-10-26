@@ -328,7 +328,7 @@ function runtimeExecutable(): string {
       // Try the next PATH entry.
     }
   }
-  throw new Error('optimizer executable not found on PATH; set OPTIMIZER_BIN to its absolute path');
+  throw new Error('optimizer executable not found on PATH; install it with `npm install -g @optimizer-layer/runtime`, or set OPTIMIZER_BIN to its absolute path');
 }
 
 type Mode = 'opt-in' | 'always-on';

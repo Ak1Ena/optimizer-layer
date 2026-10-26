@@ -15,9 +15,10 @@ Requires Node.js 24.18.x.
 From npm:
 
 ```sh
-npm install -g @optimizer-layer/runtime @optimizer-layer/agent-adapter
-npm install -g @optimizer-layer/mcp   # optional read-only MCP server
+npm install -g @optimizer-layer/runtime @optimizer-layer/agent-adapter @optimizer-layer/mcp
 ```
+
+The hooks in `agent-adapter` call the `optimizer` command from `runtime`, so install both; the hook installer refuses to run without it. `mcp` is an optional read-only MCP server with a larger dependency tree; leave it out if you don't use MCP.
 
 Or from a [GitHub release](https://github.com/Ak1Ena/optimizer-layer/releases), which contains the same three package tarballs and `SHA256SUMS`:
 

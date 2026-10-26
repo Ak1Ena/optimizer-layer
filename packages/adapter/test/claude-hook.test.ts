@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, symlinkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 
@@ -376,4 +376,12 @@ test('installer merges idempotently, keeps unrelated settings and uninstalls onl
   const invalid = spawnSync(process.execPath, [hookScript, 'install', '--settings', settings], { encoding: 'utf8', env: { ...process.env, OPTIMIZER_BIN: bin } });
   assert.equal(invalid.status, 1);
   assert.match(invalid.stderr, /JSON object/);
+  const noRuntime = join(dirname(settings), 'no-runtime.json');
+  const { OPTIMIZER_BIN: _unusedBin, ...withoutBin } = process.env;
+  const emptyPath = mkdtempSync(join(tmpdir(), 'optimizer-no-path-'));
+  t.after(() => rmSync(emptyPath, { recursive: true, force: true }));
+  const withoutRuntime = spawnSync(process.execPath, [hookScript, 'install', '--settings', noRuntime], { encoding: 'utf8', env: { ...withoutBin, PATH: emptyPath } });
+  assert.equal(withoutRuntime.status, 1, 'install refuses without a runtime to call');
+  assert.match(withoutRuntime.stderr, /npm install -g @optimizer-layer\/runtime/);
+  assert.equal(existsSync(noRuntime), false, 'a refused install writes no settings');
 });
