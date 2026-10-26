@@ -3,8 +3,27 @@
   "version": "0.1.0",
   "description": "Thin cooperative coding-agent checkpoint transport and installable skill",
   "type": "module",
-  "engines": { "node": ">=24.18.0 <25" },
-  "exports": { ".": { "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
-  "bin": { "optimizer-claude-hook": "./dist/claude-hook.js" },
-  "files": ["dist", "skill", "README.md"]
+  "engines": {
+    "node": ">=24.18.0 <25"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "optimizer-claude-hook": "./dist/claude-hook.js"
+  },
+  "files": [
+    "dist",
+    "skill",
+    "README.md"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ak1Ena/optimizer-layer.git",
+    "directory": "packages/adapter"
+  }
 }

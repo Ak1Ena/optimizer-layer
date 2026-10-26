@@ -20,7 +20,7 @@ CLI: `review --kind accept|challenge --version N --rationale TEXT --items ID,ID 
 
 ## Scope and proof
 
-Update runtime types, schema, reducer, policy, API, CLI, exports; adapter command and real CLI integration; runtime and verifier test setup; public examples, checkpoint instructions, and handoff. Existing demonstration reports remain historical evidence and are not rewritten to imply they exercised review.
+Update runtime types, schema, reducer, policy, API, CLI, exports; adapter command and real CLI integration; runtime and verifier test setup; public examples, and checkpoint instructions. Existing demonstration reports remain historical evidence and are not rewritten to imply they exercised review.
 
 Tests must prove blocked unreviewed execution and completion claims, durable acceptance, local and human challenge resolution, stale-version/citation rejection without events, immutable requirements/checks, old-log pending defaults, and bounded escalation. Run all tests, strict typecheck, compiler lint, build, and an actual CLI integration cycle.
 

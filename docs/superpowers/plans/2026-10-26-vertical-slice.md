@@ -58,7 +58,7 @@
 - [x] Run the optimizer cycle with an actual coding agent; retain events and measurements.
 - [x] Run baseline when possible; report verification, wall time, unknown tokens, and optimizer overhead without improvement claims.
 
-## Task 5. Review and handoff
+## Task 5. Review and close-out
 
 - [x] Verify package installation and document established commands in AGENTS.md and README.md.
 - [x] Run full tests, typecheck, lint, build, and installed CLI check.

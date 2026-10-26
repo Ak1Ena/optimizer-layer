@@ -31,7 +31,7 @@ Intelligence/context consume shared domain types. Runtime consumes their typed r
 - [Coding-agent evidence](2026-10-26-vertical-slice-results.json) includes all five command observations and optimizer measurements. A single slower optimized run does not establish efficiency improvement.
 - [Packaging evidence](2026-10-26-packaging-results.json) includes a clean offline tarball install and installed CLI/adapter/MCP checks against the final built runtime, including artifactFiles registration. Registry-backed clean installation remains unverified.
 - Independent core and final reviews found no remaining concrete blocker. Regressions cover appended transcript provenance, directly executed verifier pinning, and stale-artifact requirement labels.
-- User requested a handoff before the previous final response. [handoff.md](../../handoff.md) records delivered scope, exact checks, environment constraints, raw artifact locations, and resume priorities.
+- User requested a handoff before the previous final response; it recorded delivered scope, exact checks, environment constraints, and resume priorities (kept local, not published).
 
 ## Remaining limits
 

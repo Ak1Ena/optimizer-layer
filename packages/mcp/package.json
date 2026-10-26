@@ -3,12 +3,25 @@
   "version": "0.1.0",
   "description": "Read-only MCP views for a project-local optimizer runtime",
   "type": "module",
-  "engines": { "node": ">=24.18.0 <25" },
-  "bin": { "optimizer-mcp": "./dist/cli.js" },
-  "files": ["dist", "README.md"],
+  "engines": {
+    "node": ">=24.18.0 <25"
+  },
+  "bin": {
+    "optimizer-mcp": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.32.1",
     "@optimizer-layer/runtime": "0.1.0",
     "zod": "4.6.5"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ak1Ena/optimizer-layer.git",
+    "directory": "packages/mcp"
   }
 }

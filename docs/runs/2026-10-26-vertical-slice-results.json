@@ -218,13 +218,13 @@
         "projectDigest": "f1d4d5ae35519ae775f301636cc060ed0c2f9344330bc5656eaa1ab4abe86e08",
         "result": {
           "argv": [
-            "/Users/m129/.nvm/versions/node/v24.18.0/bin/node",
-            "/Users/m129/code/optimizer-layer/examples/vertical-slice/acceptance.mjs",
+            "<node>",
+            "<repo>/examples/vertical-slice/acceptance.mjs",
             "/private/tmp/optimizer-slice-20261026/optimized"
           ],
           "outcome": "failed",
           "exitCode": 1,
-          "output": "node:internal/modules/run_main:107\n    triggerUncaughtException(\n    ^\n\nAssertionError [ERR_ASSERTION]: Missing expected exception (RangeError): invalid count -1\n    at file:///Users/m129/code/optimizer-layer/examples/vertical-slice/acceptance.mjs:11:37 {\n  generatedMessage: false,\n  code: 'ERR_ASSERTION',\n  actual: undefined,\n  expected: [Function: RangeError],\n  operator: 'throws',\n  diff: 'simple'\n}\n\nNode.js v24.18.0\n",
+          "output": "node:internal/modules/run_main:107\n    triggerUncaughtException(\n    ^\n\nAssertionError [ERR_ASSERTION]: Missing expected exception (RangeError): invalid count -1\n    at file://<repo>/examples/vertical-slice/acceptance.mjs:11:37 {\n  generatedMessage: false,\n  code: 'ERR_ASSERTION',\n  actual: undefined,\n  expected: [Function: RangeError],\n  operator: 'throws',\n  diff: 'simple'\n}\n\nNode.js v24.18.0\n",
           "outputDigest": "ff07311f9d263d62ddd9b9f26c7e070168379f5dc6d47a21fd3a1eb36e3be1bd",
           "durationMs": 305.343292
         },
@@ -240,13 +240,13 @@
         "projectDigest": "f1d4d5ae35519ae775f301636cc060ed0c2f9344330bc5656eaa1ab4abe86e08",
         "result": {
           "argv": [
-            "/Users/m129/.nvm/versions/node/v24.18.0/bin/node",
-            "/Users/m129/code/optimizer-layer/examples/vertical-slice/acceptance.mjs",
+            "<node>",
+            "<repo>/examples/vertical-slice/acceptance.mjs",
             "/private/tmp/optimizer-slice-20261026/optimized"
           ],
           "outcome": "failed",
           "exitCode": 1,
-          "output": "node:internal/modules/run_main:107\n    triggerUncaughtException(\n    ^\n\nAssertionError [ERR_ASSERTION]: Missing expected exception (RangeError): invalid count -1\n    at file:///Users/m129/code/optimizer-layer/examples/vertical-slice/acceptance.mjs:11:37 {\n  generatedMessage: false,\n  code: 'ERR_ASSERTION',\n  actual: undefined,\n  expected: [Function: RangeError],\n  operator: 'throws',\n  diff: 'simple'\n}\n\nNode.js v24.18.0\n",
+          "output": "node:internal/modules/run_main:107\n    triggerUncaughtException(\n    ^\n\nAssertionError [ERR_ASSERTION]: Missing expected exception (RangeError): invalid count -1\n    at file://<repo>/examples/vertical-slice/acceptance.mjs:11:37 {\n  generatedMessage: false,\n  code: 'ERR_ASSERTION',\n  actual: undefined,\n  expected: [Function: RangeError],\n  operator: 'throws',\n  diff: 'simple'\n}\n\nNode.js v24.18.0\n",
           "outputDigest": "ff07311f9d263d62ddd9b9f26c7e070168379f5dc6d47a21fd3a1eb36e3be1bd",
           "durationMs": 307.798625
         },
@@ -262,13 +262,13 @@
         "projectDigest": "f1d4d5ae35519ae775f301636cc060ed0c2f9344330bc5656eaa1ab4abe86e08",
         "result": {
           "argv": [
-            "/Users/m129/.nvm/versions/node/v24.18.0/bin/node",
-            "/Users/m129/code/optimizer-layer/examples/vertical-slice/acceptance.mjs",
+            "<node>",
+            "<repo>/examples/vertical-slice/acceptance.mjs",
             "/private/tmp/optimizer-slice-20261026/optimized"
           ],
           "outcome": "failed",
           "exitCode": 1,
-          "output": "node:internal/modules/run_main:107\n    triggerUncaughtException(\n    ^\n\nAssertionError [ERR_ASSERTION]: Missing expected exception (RangeError): invalid count -1\n    at file:///Users/m129/code/optimizer-layer/examples/vertical-slice/acceptance.mjs:11:37 {\n  generatedMessage: false,\n  code: 'ERR_ASSERTION',\n  actual: undefined,\n  expected: [Function: RangeError],\n  operator: 'throws',\n  diff: 'simple'\n}\n\nNode.js v24.18.0\n",
+          "output": "node:internal/modules/run_main:107\n    triggerUncaughtException(\n    ^\n\nAssertionError [ERR_ASSERTION]: Missing expected exception (RangeError): invalid count -1\n    at file://<repo>/examples/vertical-slice/acceptance.mjs:11:37 {\n  generatedMessage: false,\n  code: 'ERR_ASSERTION',\n  actual: undefined,\n  expected: [Function: RangeError],\n  operator: 'throws',\n  diff: 'simple'\n}\n\nNode.js v24.18.0\n",
           "outputDigest": "ff07311f9d263d62ddd9b9f26c7e070168379f5dc6d47a21fd3a1eb36e3be1bd",
           "durationMs": 307.127458
         },
@@ -284,8 +284,8 @@
         "projectDigest": "29d7e9c77921ca21fc8894c95c5f67dae6e75838794c4c4b75d579f14de63f46",
         "result": {
           "argv": [
-            "/Users/m129/.nvm/versions/node/v24.18.0/bin/node",
-            "/Users/m129/code/optimizer-layer/examples/vertical-slice/acceptance.mjs",
+            "<node>",
+            "<repo>/examples/vertical-slice/acceptance.mjs",
             "/private/tmp/optimizer-slice-20261026/optimized"
           ],
           "outcome": "passed",
@@ -306,8 +306,8 @@
         "projectDigest": "29d7e9c77921ca21fc8894c95c5f67dae6e75838794c4c4b75d579f14de63f46",
         "result": {
           "argv": [
-            "/Users/m129/.nvm/versions/node/v24.18.0/bin/node",
-            "/Users/m129/code/optimizer-layer/examples/vertical-slice/acceptance.mjs",
+            "<node>",
+            "<repo>/examples/vertical-slice/acceptance.mjs",
             "/private/tmp/optimizer-slice-20261026/optimized"
           ],
           "outcome": "passed",

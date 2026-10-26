@@ -12,7 +12,7 @@ Requires Node.js 24.18.x.
 
 **1. Install from the latest release (once per machine).**
 
-Each [GitHub release](https://github.com/Ak1Ena/optimizer-layer/releases) contains the three package tarballs and `SHA256SUMS`. With the GitHub CLI (works for the private repository):
+Each [GitHub release](https://github.com/Ak1Ena/optimizer-layer/releases) contains the three package tarballs and `SHA256SUMS`. With the GitHub CLI:
 
 ```sh
 mkdir optimizer-release && cd optimizer-release
@@ -83,11 +83,86 @@ The project is a TypeScript ESM workspace on Node.js 24.18.x. SQLite stores proj
 
 The runtime owns state and policy. Adapters and MCP use its public interfaces. Each project stores its private runtime database at `.optimizer/runtime.sqlite`.
 
+### High-level system architecture
+
+```mermaid
+flowchart LR
+  user([User])
+  subgraph host[Coding agent host]
+    agent[Working agent<br/>Claude Code / Codex]
+    hooks[Claude Code hooks<br/>optimizer-claude-hook]
+    skill[Checkpoint skill<br/>optimizer-checkpoint]
+  end
+  subgraph runtime[Optimizer runtime]
+    cli[CLI and public API]
+    goal[Goal intelligence<br/>contract and questions]
+    context[Context intelligence<br/>retrieval and decisions]
+    engine{{Decision engine<br/>nextAction}}
+    verify[Verification<br/>registered checks]
+  end
+  store[(.optimizer/<br/>runtime.sqlite<br/>prompts.jsonl<br/>project.json)]
+  mcp[Optional MCP server<br/>read-only status and events]
+  checks[[Approved check commands<br/>from optimizer enable]]
+
+  user -- plain-language request, answers --> agent
+  user -- optimizer enable --> cli
+  agent -- prompts, edits, stop --> hooks
+  agent -- checkpoint commands --> skill
+  hooks -- capture, current --> cli
+  skill -- runOptimizer --> cli
+  cli --> goal & context & engine & verify
+  verify -- runs without shell --> checks
+  goal & context & engine & verify <--> store
+  mcp -. read-only .-> store
+  hooks -- context, deny edit, block stop --> agent
+
+  classDef core fill:#dbeafe,stroke:#508de0,color:#173b71
+  classDef optional fill:#f3f4f6,stroke:#9ca3af,color:#444,stroke-dasharray:5 4
+  classDef data fill:#dcfce7,stroke:#35a669,color:#14532d
+  class cli,goal,context,engine,verify core
+  class mcp,skill optional
+  class store,checks data
+```
+
+### Inside the decision engine
+
+Every hook and checkpoint asks the runtime for the next action. `nextAction` re-derives it from the replayed session state, after dropping stale context, answers and evidence, and takes the first rule that applies:
+
+```mermaid
+flowchart TD
+  start([next]) --> paused{Paused after<br/>repeated failures?}
+  paused -- yes --> reconsider[reconsider<br/>agent retains or revises strategy]
+  paused -- no --> escalated{Escalated?}
+  escalated -- yes --> escalate[escalate<br/>human decides]
+  escalated -- no --> human{Critical human<br/>question open?}
+  human -- yes --> clarify[clarify<br/>ask the user]
+  human -- no --> local{Local question open, or context<br/>missing, incomplete, uncovered,<br/>unassessed or cited stale?}
+  local -- yes --> retrieve[retrieve<br/>investigate and assess]
+  local -- no --> review{Current goal version<br/>accepted by agent?}
+  review -- no --> rev[review<br/>accept or challenge contract]
+  review -- yes --> verified{Every requirement and check<br/>has current passing evidence?}
+  verified -- yes --> complete([complete])
+  verified -- no --> claimed{Completion claimed?}
+  claimed -- yes --> verifyAction[verify<br/>run all checks]
+  claimed -- no --> execute[execute<br/>agent works, runs checks]
+
+  execute -. same failure 3 times .-> pausedState[pause, max 2 rounds,<br/>then escalate]
+
+  classDef action fill:#dbeafe,stroke:#508de0,color:#173b71
+  classDef human fill:#fef3c7,stroke:#d97706,color:#78350f
+  classDef done fill:#dcfce7,stroke:#35a669,color:#14532d
+  class reconsider,retrieve,rev,verifyAction,execute action
+  class escalate,clarify human
+  class complete done
+```
+
+The Claude Code hooks deny Edit and Write tools during `clarify`, `retrieve`, `review`, `reconsider` and `escalate`, and block the end of a turn until `complete`, except while waiting for the user on `clarify` or `escalate`.
+
 ## Current capabilities
 
 Implemented: structured goal extraction, versioned contract review and challenge, bounded lexical context retrieval, provenance-aware decision import, context sufficiency assessment, durable event replay, cooperative reconsideration, and independent registered-command verification.
 
-The shipped integrations are explicit skill/CLI checkpoints and opt-in Claude Code hooks (below). The runtime can gate its own checks. The hooks deny file-edit tools and block ending a turn according to the runtime's next action; they are tested with real hook JSON on stdin, not yet in a live Claude Code session. Bash file edits are not intercepted, and Codex hooks are not implemented.
+The shipped integrations are explicit skill/CLI checkpoints and opt-in Claude Code hooks (below). The runtime can gate its own checks. The hooks deny file-edit tools and block ending a turn according to the runtime's next action; they are tested with real hook JSON on stdin and were exercised once in a live Claude Code 2.1 session on the parseCount fixture (plain-language request, drafted contract, approval, a denied early edit, verified completion). Bash file edits are not intercepted, and Codex hooks are not implemented.
 
 Broader natural-language interpretation through a replaceable model provider, richer code relationships, native conversation import, and repeated comparative evaluation remain future work. The current goal syntax and limits are documented below.
 
@@ -102,7 +177,6 @@ examples/vertical-slice/      Coding fixture, goal, and independent acceptance r
 scripts/                     Packaging and demonstration tools
 docs/superpowers/             Designs and implementation plans
 docs/runs/                    Implementation ledger and recorded evidence
-handoff.md                    Current state and continuation notes
 ```
 
 ## Setup and checks
@@ -256,4 +330,8 @@ The goal is a working restricted-domain optimizer, not arbitrary natural-languag
 - [Contract review design](docs/superpowers/specs/2026-10-26-contract-review-design.md) and [implementation plan](docs/superpowers/plans/2026-10-26-contract-review.md).
 - [Implementation and verification ledger](docs/runs/2026-10-26-implementation.md).
 - Historical [coding-agent demonstration](docs/runs/2026-10-26-vertical-slice-results.json) and [packaging evidence](docs/runs/2026-10-26-packaging-results.json).
-- [Handoff](handoff.md): delivered scope, remaining limits, and continuation priorities.
+- Local paths in recorded reports are redacted (`<repo>`, `<node>`, `<home>`).
+
+## License
+
+[MIT](LICENSE)

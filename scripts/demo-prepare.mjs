@@ -1,9 +1,10 @@
 import { cpSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { resolve, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { performance } from 'node:perf_hooks';
 
-const destination = resolve(process.argv[2] ?? '/private/tmp/optimizer-vertical-slice');
+const destination = resolve(process.argv[2] ?? join(tmpdir(), 'optimizer-vertical-slice'));
 mkdirSync(destination, { recursive: true });
 const root = realpathSync(destination);
 const fixture = resolve('examples/vertical-slice/fixture');

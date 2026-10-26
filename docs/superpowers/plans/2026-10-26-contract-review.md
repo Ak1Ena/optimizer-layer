@@ -37,7 +37,7 @@ Interfaces: `Goal.version: number`; `SessionState.review: ContractReview`; `Revi
 
 ## Task 2: Complete cooperative workflow
 
-Files: runtime CLI; adapter command union, real CLI test and checkpoint skill; MCP verifier-test setup if needed; root/runtime/adapter READMEs; handoff and implementation ledger.
+Files: runtime CLI; adapter command union, real CLI test and checkpoint skill; MCP verifier-test setup if needed; root/runtime/adapter READMEs; implementation ledger.
 
 Interfaces: CLI `review` options from the spec; adapter `OptimizerCommand` includes `review`. No adapter policy and no MCP write tool.
 

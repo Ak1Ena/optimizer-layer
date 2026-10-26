@@ -22,6 +22,7 @@ for (const name of readdirSync('packages').sort()) {
     chmodSync(resolve(staged, path), 0o755);
     chmodSync(resolve(directory, path), 0o755);
   }
+  cpSync('LICENSE', join(staged, 'LICENSE'));
   writeFileSync(join(staged, 'package.json'), JSON.stringify(manifest, null, 2) + '\n');
   process.stdout.write(`Staged ${manifest.name} in ${staged}\n`);
 }
