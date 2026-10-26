@@ -1,0 +1,94 @@
+{
+  "node": "v24.18.0",
+  "prefix": "/private/tmp/optimizer-package-validation/locked-prefix",
+  "project": "/private/tmp/optimizer-package-validation/smoke-project",
+  "sessionId": "session-6c2aca00-2e20-4726-b73b-ee7423379b5e",
+  "checks": {
+    "installedHelp": true,
+    "installedInit": true,
+    "installedStart": true,
+    "installedDurableStatus": true,
+    "installedAdapter": true,
+    "officialSdkMcpHandshake": true,
+    "installedMcpListTools": [
+      "optimizer_session_status",
+      "optimizer_session_events"
+    ],
+    "installedMcpStatus": true,
+    "installedMcpEvents": true
+  },
+  "stderr": "",
+  "lockValidation": {
+    "registryPackages": 97,
+    "allRegistryEntriesHaveResolvedAndIntegrity": true,
+    "offlineLockOnlyInstall": "passed",
+    "registryCleanCi": "blocked: ENOTCACHED registry tarball with fresh empty cache",
+    "localTarballCleanCi": "passed: added 97 packages using conventional temporary local-tarball lock",
+    "offlineLockOnlyIdempotent": true,
+    "rootNpmLs": "passed: no missing/extraneous dependencies",
+    "sha256": "c5f77958ba1cfcb9817071a6c64ba68afcf81cdf8ae1502a85361b0734804555"
+  },
+  "productTarballs": [
+    {
+      "name": "@optimizer-layer/runtime",
+      "filename": "optimizer-layer-runtime-0.1.0.tgz",
+      "integrity": "sha512-kGdoR1r7WEzNXez74zQBHW6WUDe4zr0YmOn0rCmFYkD3h0/oAZB31OZjjmNiNWjTP//118TE6ap6NcevUdXvrQ==",
+      "files": [
+        "README.md",
+        "dist/cli.d.ts",
+        "dist/cli.js",
+        "dist/context.d.ts",
+        "dist/context.js",
+        "dist/index.d.ts",
+        "dist/index.js",
+        "dist/intelligence.d.ts",
+        "dist/intelligence.js",
+        "dist/process.d.ts",
+        "dist/process.js",
+        "dist/runtime.d.ts",
+        "dist/runtime.js",
+        "dist/schema.d.ts",
+        "dist/schema.js",
+        "dist/store.d.ts",
+        "dist/store.js",
+        "dist/types.d.ts",
+        "dist/types.js",
+        "dist/verification.d.ts",
+        "dist/verification.js",
+        "package.json"
+      ]
+    },
+    {
+      "name": "@optimizer-layer/agent-adapter",
+      "filename": "optimizer-layer-agent-adapter-0.1.0.tgz",
+      "integrity": "sha512-00CSR0vC8pwQ3gkAkXtQI5pEJcVuWGiVlIOr242jUYxFicjOr/CeItuiDjdM8jEQclOnhFIfGiG1M1Z1XTTJRQ==",
+      "files": [
+        "README.md",
+        "dist/index.d.ts",
+        "dist/index.js",
+        "package.json",
+        "skill/optimizer-checkpoint/SKILL.md"
+      ]
+    },
+    {
+      "name": "@optimizer-layer/mcp",
+      "filename": "optimizer-layer-mcp-0.1.0.tgz",
+      "integrity": "sha512-gnzUXJiNerIJ0VL7o0YK0n8/RZ0GnHhXLxdiAvwe8/wSDjEwbf5FqqG4zgEcdBwvs/hthaDraKcOWeDPGrts/g==",
+      "files": [
+        "README.md",
+        "dist/cli.d.ts",
+        "dist/cli.js",
+        "dist/server.d.ts",
+        "dist/server.js",
+        "package.json"
+      ]
+    }
+  ],
+  "revalidatedAt": "2026-10-25T18:56:44.163Z",
+  "finalProject": "/private/tmp/optimizer-installed-final-5Yw2cp",
+  "finalSessionId": "session-e07f549a-19c3-4c09-8007-6e212e6a8728",
+  "finalInstalledArtifactFilesApi": true,
+  "finalInstalledCliAdapterMcp": true,
+  "finalInstalledRuntimeDigest": "e908aeed4379110a0f548d830f797e74b4f2190ac0df62b81393d84ea4c95089",
+  "currentBuiltRuntimeDigest": "e908aeed4379110a0f548d830f797e74b4f2190ac0df62b81393d84ea4c95089"
+}

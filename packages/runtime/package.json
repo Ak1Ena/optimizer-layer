@@ -1,0 +1,11 @@
+{
+  "name": "@optimizer-layer/runtime",
+  "version": "0.1.0",
+  "description": "Local cooperative goal-driven optimizer runtime",
+  "type": "module",
+  "engines": { "node": ">=24.18.0 <25" },
+  "exports": { ".": { "development": "./src/index.ts", "types": "./dist/index.d.ts", "default": "./dist/index.js" } },
+  "bin": { "optimizer": "./dist/cli.js" },
+  "files": ["dist", "README.md"],
+  "dependencies": { "zod": "4.6.5" }
+}
