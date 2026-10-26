@@ -1,0 +1,56 @@
+name: npm-publish
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+    secrets:
+      NPM_TOKEN:
+        required: false
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to publish (e.g. v0.2.0)
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+      TAG: ${{ inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Skip without token
+        if: env.NPM_TOKEN == ''
+        run: echo "::notice::NPM_TOKEN not set; skipping npm publish."
+
+      - uses: actions/setup-node@v5
+        if: env.NPM_TOKEN != ''
+        with:
+          node-version: 24.18.0
+          registry-url: https://registry.npmjs.org
+
+      - name: Publish release tarballs
+        if: env.NPM_TOKEN != ''
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          version="${TAG#v}"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets --pattern '*.tgz' --pattern SHA256SUMS
+          (cd assets && sha256sum -c SHA256SUMS)
+          # Runtime first: the MCP package depends on it.
+          for package in runtime agent-adapter mcp; do
+            name="@optimizer-layer/$package"
+            if npm view "$name@$version" version >/dev/null 2>&1; then
+              echo "$name@$version is already published; skipping."
+              continue
+            fi
+            npm publish "assets/optimizer-layer-$package-$version.tgz" --access public --provenance
+          done

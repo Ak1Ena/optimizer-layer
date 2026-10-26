@@ -10,9 +10,16 @@ The current prototype delivers a bounded goal-to-verification cycle. Improved ef
 
 Requires Node.js 24.18.x.
 
-**1. Install from the latest release (once per machine).**
+**1. Install (once per machine).**
 
-Each [GitHub release](https://github.com/Ak1Ena/optimizer-layer/releases) contains the three package tarballs and `SHA256SUMS`. With the GitHub CLI:
+From npm:
+
+```sh
+npm install -g @optimizer-layer/runtime @optimizer-layer/agent-adapter
+npm install -g @optimizer-layer/mcp   # optional read-only MCP server
+```
+
+Or from a [GitHub release](https://github.com/Ak1Ena/optimizer-layer/releases), which contains the same three package tarballs and `SHA256SUMS`:
 
 ```sh
 mkdir optimizer-release && cd optimizer-release
@@ -23,7 +30,7 @@ npm install -g ./optimizer-layer-*.tgz
 
 To build from source instead: `npm ci && npm run build`, then `npm pack ./dist/npm/runtime ./dist/npm/adapter ./dist/npm/mcp` and install those tarballs.
 
-Maintainers publish a release by bumping the version in `packages/*/package.json` and pushing a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The [release workflow](.github/workflows/release.yml) runs tests, typecheck, lint and build, then attaches the tarballs.
+Maintainers publish a release by bumping the version in `packages/*/package.json` and pushing a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The [release workflow](.github/workflows/release.yml) runs tests, typecheck, lint and build, attaches the tarballs, then publishes those same tarballs to npm with provenance when the repository has an `NPM_TOKEN` secret (skipped otherwise). To publish an existing release, run the [npm-publish workflow](.github/workflows/npm-publish.yml) manually with its tag.
 
 The binaries use `#!/usr/bin/env node`. If your default `node` is older than 24.18, run them through a wrapper that calls Node.js 24 explicitly, because older versions lack `node:sqlite`.
 
