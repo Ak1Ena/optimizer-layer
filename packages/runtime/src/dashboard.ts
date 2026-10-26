@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { createServer, type Server } from 'node:http';
 import { join } from 'node:path';
 import { Runtime } from './runtime.ts';
+import { verifiedRequirementIds } from './intelligence.ts';
 import { projectView, readProjectConfig, registeredProjects } from './project.ts';
 
 const sessionLimit = 20;
@@ -20,8 +21,12 @@ function sessionView(runtime: Runtime, id: string) {
     timing.optimizerMs += item.optimizerMs;
     timing.externalMs += item.externalMs;
   }
+  const times = [...runtime.events(id).map(({ event }) => event.at), ...runtime.measurements(id).map(item => item.at)];
   return {
     id,
+    lastActivity: times.reduce<string | null>((max, at) => (max === null || at > max ? at : max), null),
+    status: projectStatus({ nextAction: action }, false),
+    verifiedRequirements: verifiedRequirementIds(state),
     goalVersion: state.goal.version,
     requirements: state.goal.requirements.map(({ id, statement, acceptance }) => ({ id, statement, acceptance })),
     openQuestions: state.goal.uncertainties.filter(item => item.resolution.kind === 'open').map(({ id, owner, question }) => ({ id, owner, question })),
@@ -37,10 +42,21 @@ function sessionView(runtime: Runtime, id: string) {
   };
 }
 
+type Latest = { error?: string; nextAction?: { kind: string } } | undefined;
+
+/** Home-page status from the newest session's next action; a pending check proposal always needs the user. */
+export function projectStatus(latest: Latest, pending: boolean): 'waiting' | 'working' | 'paused' | 'verified' | 'idle' | 'error' {
+  if (latest?.error !== undefined) return 'error';
+  const kind = latest?.nextAction?.kind;
+  if (pending || kind === 'clarify' || kind === 'escalate') return 'waiting';
+  if (kind === undefined) return 'idle';
+  return kind === 'complete' ? 'verified' : kind === 'reconsider' ? 'paused' : 'working';
+}
+
 function projectState(root: string) {
   const { pendingChecks, ...view } = projectView(readProjectConfig(root));
   const project = { root, ...view, pendingChecks: pendingChecks?.argv ?? null };
-  if (!existsSync(join(root, '.optimizer', 'runtime.sqlite'))) return { ...project, sessionCount: 0, sessions: [] };
+  if (!existsSync(join(root, '.optimizer', 'runtime.sqlite'))) return { ...project, status: projectStatus(undefined, pendingChecks !== null), lastActivity: null, sessionCount: 0, sessions: [] };
   const runtime = new Runtime(root, { readOnly: true });
   try {
     const ids = runtime.sessions();
@@ -49,10 +65,11 @@ function projectState(root: string) {
       try {
         return sessionView(runtime, id);
       } catch (error) {
-        return { id, error: message(error) };
+        return { id, status: 'error' as const, error: message(error) };
       }
     });
-    return { ...project, sessionCount: ids.length, sessions };
+    const lastActivity = sessions.reduce<string | null>((max, item) => ('lastActivity' in item && item.lastActivity !== null && (max === null || item.lastActivity > max) ? item.lastActivity : max), null);
+    return { ...project, status: projectStatus(sessions[0], pendingChecks !== null), lastActivity, sessionCount: ids.length, sessions };
   } finally {
     runtime.close();
   }
@@ -65,7 +82,7 @@ export function dashboardState() {
       try {
         return projectState(root);
       } catch (error) {
-        return { root, error: message(error) };
+        return { root, status: 'error' as const, lastActivity: null, error: message(error) };
       }
     }),
   };
@@ -78,118 +95,274 @@ const page = `<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Optimizer dashboard</title>
 <style>
-:root { color-scheme: light dark; --bg: #fafafa; --fg: #1d1d1f; --muted: #666; --card: #fff; --line: #ddd; --bad: #b3261e; --good: #1b7a3a; }
-@media (prefers-color-scheme: dark) { :root { --bg: #161618; --fg: #ececec; --muted: #9a9a9a; --card: #222226; --line: #3a3a3e; --bad: #ff8a80; --good: #7bd88f; } }
-body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; }
-main { max-width: 1100px; margin: 0 auto; }
-h1 { font-size: 20px; margin: 0 0 4px; }
-h2 { font-size: 15px; margin: 0 0 8px; word-break: break-all; }
-section { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; margin: 12px 0; }
-dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 0 0 8px; }
-dt { color: var(--muted); }
-dd { margin: 0; white-space: pre-wrap; word-break: break-word; }
-details { border-top: 1px solid var(--line); padding: 6px 0; }
-summary { cursor: pointer; font-weight: 600; }
-table { border-collapse: collapse; margin: 4px 0; }
-td, th { text-align: left; padding: 2px 10px 2px 0; vertical-align: top; }
+:root { color-scheme: light dark; --bg: #f6f5f1; --fg: #1c1b19; --muted: #6b6860; --card: #fffefb; --line: #e1ded5; --accent: #2a5db0;
+  --waiting-bg: #fde9c4; --waiting-fg: #7a4a00; --working-bg: #d9e7fb; --working-fg: #1d4585; --paused-bg: #ece3f7; --paused-fg: #5a3a8a;
+  --verified-bg: #d8f0de; --verified-fg: #17612e; --idle-bg: #ebe9e2; --idle-fg: #5d5a52; --error-bg: #f9d9d5; --error-fg: #a02418; }
+@media (prefers-color-scheme: dark) { :root { --bg: #151514; --fg: #ebe9e3; --muted: #9d9a90; --card: #1e1e1c; --line: #34332f; --accent: #8fb4f0;
+  --waiting-bg: #4a3710; --waiting-fg: #f6cd82; --working-bg: #1b3252; --working-fg: #a8c8f5; --paused-bg: #35294d; --paused-fg: #cdb5f0;
+  --verified-bg: #173a24; --verified-fg: #8fdba5; --idle-bg: #2b2a27; --idle-fg: #a8a59b; --error-bg: #4d1f1a; --error-fg: #ffa89e; } }
+* { box-sizing: border-box; }
+body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 980px; margin: 0 auto; }
+h1 { font-size: 22px; margin: 0 0 2px; letter-spacing: -0.01em; }
+h2 { font-size: 13px; margin: 20px 0 6px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+a { color: var(--accent); }
 .muted { color: var(--muted); }
-.bad { color: var(--bad); }
-.good { color: var(--good); }
-code, .mono { font-family: ui-monospace, monospace; font-size: 13px; }
+.small { font-size: 13px; }
+.path { word-break: break-all; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; word-break: break-all; }
+.head { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 16px; align-items: baseline; margin-bottom: 14px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin: 12px 0; }
+.pill { display: inline-block; padding: 1px 10px; border-radius: 999px; font-size: 12.5px; font-weight: 600; white-space: nowrap; }
+.pill.waiting { background: var(--waiting-bg); color: var(--waiting-fg); }
+.pill.working { background: var(--working-bg); color: var(--working-fg); }
+.pill.paused { background: var(--paused-bg); color: var(--paused-fg); }
+.pill.verified { background: var(--verified-bg); color: var(--verified-fg); }
+.pill.idle { background: var(--idle-bg); color: var(--idle-fg); }
+.pill.error { background: var(--error-bg); color: var(--error-fg); }
+.cols, .row { display: grid; grid-template-columns: minmax(0, 2fr) 9.5em minmax(0, 3fr) 7em 5em; gap: 4px 14px; align-items: center; }
+.cols { padding: 0 16px; color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+.row { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; margin: 8px 0; color: inherit; text-decoration: none; }
+.row:hover, .row:focus-visible { border-color: var(--accent); outline: none; }
+.name { font-weight: 600; }
+.clip { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.num { text-align: right; }
+.toggle { background: none; border: 1px solid var(--line); border-radius: 8px; color: var(--accent); padding: 6px 12px; font: inherit; cursor: pointer; margin-top: 8px; }
+.next { font-size: 17px; font-weight: 600; margin: 8px 0 4px; }
+ul.plain { list-style: none; margin: 0; padding: 0; }
+ul.plain li { padding: 6px 0; border-top: 1px solid var(--line); display: grid; grid-template-columns: 1.6em minmax(0, 1fr); }
+ul.plain li:first-child { border-top: 0; }
+.ok { color: var(--verified-fg); font-weight: 700; }
+.todo { color: var(--muted); }
+.runs { display: grid; grid-template-columns: max-content max-content max-content; gap: 4px 18px; }
+details { border-top: 1px solid var(--line); padding: 8px 0; }
+summary { cursor: pointer; }
+@media (max-width: 680px) {
+  body { padding: 12px; }
+  .cols { display: none; }
+  .row { grid-template-columns: minmax(0, 1fr) auto; }
+  .row .task { grid-column: 1 / -1; }
+  .row .num { text-align: left; }
+}
 </style>
 </head>
 <body>
 <main>
-<h1>Optimizer dashboard</h1>
-<p class="muted" id="status">Loading...</p>
-<div id="projects"></div>
+<div id="app"></div>
+<p class="muted small" id="status">Loading...</p>
 </main>
 <script>
 const token = new URLSearchParams(location.search).get('token') || '';
+const labels = { waiting: 'Waiting for you', working: 'Working', paused: 'Paused', verified: 'Verified', idle: 'Idle', error: 'Unreadable' };
 const opened = new Set();
+let data = null;
+let lastText = '';
+let showIdle = false;
+
 function el(tag, text, className) {
   const node = document.createElement(tag);
   if (text !== undefined && text !== null) node.textContent = String(text);
   if (className) node.className = className;
   return node;
 }
+function pill(status) { return el('span', labels[status] || status, 'pill ' + status); }
+function baseName(path) { return path.split('/').filter(Boolean).pop() || path; }
 function duration(ms) { return ms < 1000 ? Math.round(ms) + ' ms' : (ms / 1000).toFixed(1) + ' s'; }
-function list(rows) { return rows.length ? rows.map(argv => argv.join(' ')).join('\\n') : 'none'; }
-function fields(pairs) {
-  const dl = el('dl');
-  for (const [name, value, className] of pairs) dl.append(el('dt', name), el('dd', value, className));
-  return dl;
+function ago(iso) {
+  if (!iso) return 'no activity';
+  const seconds = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+  if (seconds < 45) return 'just now';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return minutes + ' min ago';
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return hours + (hours === 1 ? ' hour ago' : ' hours ago');
+  const days = Math.round(hours / 24);
+  return days + (days === 1 ? ' day ago' : ' days ago');
 }
-function table(head, rows) {
-  const node = el('table');
-  const top = el('tr');
-  for (const name of head) top.append(el('th', name));
-  node.append(top);
-  for (const row of rows) {
-    const line = el('tr');
-    for (const cell of row) line.append(el('td', cell));
-    node.append(line);
-  }
-  return node;
+function clip(text, max) { return text.length > max ? text.slice(0, max - 1) + '…' : text; }
+function firstTask(session) {
+  const first = session && !session.error && session.requirements[0];
+  return first ? first.statement : '';
 }
-function session(item, active) {
-  const box = el('details');
-  box.open = opened.has(item.id) || (item.id === active && !opened.has('closed:' + item.id));
-  box.addEventListener('toggle', () => {
-    opened.delete(box.open ? 'closed:' + item.id : item.id);
-    opened.add(box.open ? item.id : 'closed:' + item.id);
-  });
-  if (item.error) {
-    box.append(el('summary', item.id), el('p', 'Unreadable: ' + item.error, 'bad'));
-    return box;
+function nextStep(session) {
+  const kind = session.nextAction.kind;
+  const question = session.openQuestions.find(q => q.owner === 'human') || session.openQuestions[0];
+  const why = session.control.reason ? ' (' + session.control.reason + ')' : '';
+  if (kind === 'review') return 'Claude must review and accept the contract.';
+  if (kind === 'retrieve') return 'Claude is gathering project context.';
+  if (kind === 'clarify') return question ? 'Waiting for your answer: ' + question.question : 'Waiting for your answer: ' + session.nextAction.reason;
+  if (kind === 'execute') return 'Claude is implementing; checks run next.';
+  if (kind === 'verify') return 'Checks are running to verify the work.';
+  if (kind === 'reconsider') return 'Paused: Claude must explain whether to keep or change its approach' + why + '.';
+  if (kind === 'escalate') return 'Needs you: ' + session.nextAction.reason;
+  return 'Verified: all requirements passed.';
+}
+function route() {
+  const match = /^#p=(.+)$/.exec(location.hash);
+  if (!match) return null;
+  try { return decodeURIComponent(match[1]); } catch (error) { return null; }
+}
+
+function taskBody(session) {
+  const box = el('div');
+  if (session.error) { box.append(el('p', 'Unreadable: ' + session.error, 'pill error')); return box; }
+  box.append(el('div', nextStep(session), 'next'));
+  box.append(el('div', 'Last activity ' + ago(session.lastActivity) + ' · goal v' + session.goalVersion + ' · ' + session.review, 'muted small'));
+  box.append(el('h2', 'Requirements'));
+  const reqs = el('ul', null, 'plain');
+  for (const r of session.requirements) {
+    const done = session.verifiedRequirements.includes(r.id);
+    const li = el('li');
+    li.append(el('span', done ? '✓' : '○', done ? 'ok' : 'todo'));
+    const body = el('div');
+    body.append(el('div', r.statement), el('div', 'Accepted when: ' + (r.acceptance || '(missing)'), 'muted small'));
+    li.append(body);
+    reqs.append(li);
   }
-  const state = item.complete ? 'complete' : item.nextAction.kind;
-  box.append(el('summary', item.id + ' | goal v' + item.goalVersion + ' | ' + state + (item.id === active ? ' | active' : '')));
-  box.append(fields([
-    ['Next action', item.nextAction.kind + ': ' + item.nextAction.reason],
-    ['Review', item.review],
-    ['Control', item.control.kind + (item.control.reason ? ' (' + item.control.reason + ')' : ''), item.control.kind === 'running' ? '' : 'bad'],
-    ['Completion', item.complete ? 'verified complete' : item.completionClaimed ? 'claimed, not verified' : 'not claimed', item.complete ? 'good' : ''],
-    ['Timing', 'optimizer ' + duration(item.timing.optimizerMs) + ', external ' + duration(item.timing.externalMs)],
-  ]));
-  box.append(el('strong', 'Requirements'), table(['ID', 'Requirement', 'Acceptance'], item.requirements.map(r => [r.id, r.statement, r.acceptance || '(missing)'])));
-  box.append(el('strong', 'Open questions'));
-  box.append(item.openQuestions.length ? table(['ID', 'Owner', 'Question'], item.openQuestions.map(q => [q.id, q.owner, q.question])) : el('p', 'none', 'muted'));
-  box.append(el('strong', 'Check runs'));
-  box.append(item.checkRuns.length ? table(['Check', 'Outcome', 'Duration', 'Time'], item.checkRuns.slice().reverse().map(c => [c.checkId, c.outcome, duration(c.durationMs), new Date(c.at).toLocaleString()])) : el('p', 'none', 'muted'));
+  box.append(reqs);
+  if (session.openQuestions.length) {
+    box.append(el('h2', 'Open questions'));
+    const qs = el('ul', null, 'plain');
+    for (const q of session.openQuestions) {
+      const li = el('li');
+      li.append(el('span', '?', 'todo'));
+      li.append(el('div', q.question + ' (' + q.owner + ')'));
+      qs.append(li);
+    }
+    box.append(qs);
+  }
+  box.append(el('h2', 'Check runs'));
+  if (!session.checkRuns.length) box.append(el('p', 'No checks have run yet.', 'muted small'));
+  else {
+    const runs = el('div', null, 'runs small');
+    for (const c of session.checkRuns.slice().reverse()) {
+      runs.append(el('span', new Date(c.at).toLocaleString(), 'muted'), el('span', c.outcome, c.outcome === 'passed' ? 'ok' : ''), el('span', duration(c.durationMs), 'muted'));
+    }
+    box.append(runs);
+  }
   return box;
 }
-function project(item) {
-  const box = el('section');
-  box.append(el('h2', item.root));
-  if (item.error) {
-    box.append(el('p', 'Unreadable: ' + item.error, 'bad'));
-    return box;
-  }
-  box.append(fields([
-    ['State', item.enabled ? 'enabled' : 'disabled (opted out)', item.enabled ? '' : 'muted'],
-    ['Approved checks', list(item.checks)],
-    ['Pending proposal', item.pendingChecks ? list(item.pendingChecks) + '\\n(the user approves it in chat)' : 'none'],
-    ['Active session', item.activeSessionId || 'none'],
-    ['Sessions', item.sessionCount > item.sessions.length ? item.sessions.length + ' newest of ' + item.sessionCount : String(item.sessionCount)],
-  ]));
-  for (const entry of item.sessions) box.append(session(entry, item.activeSessionId));
+function argvList(rows, empty) {
+  if (!rows || !rows.length) return el('p', empty, 'muted small');
+  const box = el('div');
+  for (const argv of rows) box.append(el('div', argv.join(' '), 'mono'));
   return box;
+}
+
+function detail(item) {
+  const frag = document.createDocumentFragment();
+  const back = el('a', '← All projects');
+  back.href = '#';
+  frag.append(back);
+  const head = el('div', null, 'head');
+  const title = el('div');
+  title.append(el('h1', baseName(item.root)), el('div', item.root, 'muted small path'));
+  head.append(title, pill(item.status));
+  frag.append(head);
+  if (item.error) { frag.append(el('p', 'Unreadable: ' + item.error, 'pill error')); return frag; }
+  if (!item.enabled) frag.append(el('p', 'Optimizer is turned off for this project (opted out). History is kept.', 'muted'));
+  if (item.pendingChecks) {
+    const card = el('div', null, 'card');
+    card.append(el('div', 'A check proposal is waiting for your approval. Approve it in the Claude chat.', 'next'), argvList(item.pendingChecks, ''));
+    frag.append(card);
+  }
+  const [latest, ...older] = item.sessions;
+  const card = el('div', null, 'card');
+  if (latest) {
+    card.append(el('h2', 'Current task'), el('div', latest.error ? latest.id : firstTask(latest)));
+    card.append(taskBody(latest));
+  } else card.append(el('p', 'No tasks yet. A task starts when Claude drafts a contract for a coding request in this folder.', 'muted'));
+  frag.append(card);
+  const checks = el('div', null, 'card');
+  checks.append(el('h2', 'Approved checks'), argvList(item.checks, 'None approved yet.'));
+  frag.append(checks);
+  if (older.length) {
+    const history = el('div', null, 'card');
+    history.append(el('h2', 'Older tasks (' + older.length + (item.sessionCount > item.sessions.length ? ' of ' + (item.sessionCount - 1) : '') + ')'));
+    for (const s of older) {
+      const box = el('details');
+      const key = item.root + '|' + s.id;
+      box.open = opened.has(key);
+      box.addEventListener('toggle', () => { if (box.open) opened.add(key); else opened.delete(key); });
+      const summary = el('summary');
+      summary.append(pill(s.status), el('span', ' ' + clip(firstTask(s) || s.id, 80) + ' · ' + ago(s.lastActivity), 'small'));
+      box.append(summary, taskBody(s));
+      history.append(box);
+    }
+    frag.append(history);
+  }
+  return frag;
+}
+function listView(projects) {
+  const frag = document.createDocumentFragment();
+  const shown = projects.filter(p => p.status !== 'idle');
+  const idle = projects.filter(p => p.status === 'idle');
+  const sorted = list => list.slice().sort((a, b) => (b.lastActivity || '').localeCompare(a.lastActivity || ''));
+  const count = status => shown.filter(p => p.status === status).length;
+  const parts = [['waiting', 'waiting for you'], ['working', 'working'], ['paused', 'paused'], ['verified', 'verified'], ['error', 'unreadable']].filter(([s]) => count(s)).map(([s, text]) => count(s) + ' ' + text);
+  const head = el('div', null, 'head');
+  head.append(el('h1', 'Optimizer'), el('div', parts.length ? parts.join(' · ') : 'Nothing active', 'muted'));
+  frag.append(head);
+  if (!projects.length) {
+    const card = el('div', null, 'card');
+    card.append(el('div', 'No projects yet', 'next'), el('p', 'A project appears here after its first Claude Code prompt in a folder with the optimizer hooks installed. Open Claude Code in a project, send a prompt, and it shows up within a few seconds.', 'muted'));
+    frag.append(card);
+    return frag;
+  }
+  if (shown.length) {
+    const cols = el('div', null, 'cols');
+    for (const name of ['Project', 'Status', 'Task', 'Last activity', 'Checks']) cols.append(el('span', name));
+    frag.append(cols);
+  }
+  const row = p => {
+    const a = el('a', null, 'row');
+    a.href = '#p=' + encodeURIComponent(p.root);
+    const name = el('div');
+    name.append(el('div', baseName(p.root), 'name clip'), el('div', p.root, 'muted small clip'));
+    const task = p.error ? p.error : p.sessions[0] ? firstTask(p.sessions[0]) : 'No tasks yet';
+    a.append(name, pill(p.status), el('div', clip(task, 120), 'task clip' + (p.sessions && p.sessions[0] ? '' : ' muted')), el('div', ago(p.lastActivity), 'small muted'), el('div', p.error ? '' : (p.checks.length + (p.checks.length === 1 ? ' check' : ' checks')), 'small muted num'));
+    return a;
+  };
+  for (const p of sorted(shown)) frag.append(row(p));
+  if (!shown.length) frag.append(el('p', 'No project has an active or finished task right now.', 'muted'));
+  if (idle.length) {
+    const button = el('button', (showIdle ? 'Hide ' : 'Show ') + idle.length + ' idle project' + (idle.length === 1 ? '' : 's'), 'toggle');
+    button.type = 'button';
+    button.addEventListener('click', () => { showIdle = !showIdle; render(); });
+    frag.append(button);
+    if (showIdle) for (const p of sorted(idle)) frag.append(row(p));
+  }
+  return frag;
+}
+
+function render() {
+  if (!data) return;
+  const selected = route();
+  const item = selected === null ? null : data.projects.find(p => p.root === selected);
+  const app = document.getElementById('app');
+  const y = window.scrollY;
+  app.replaceChildren(item ? detail(item) : listView(data.projects));
+  window.scrollTo(0, y);
 }
 async function refresh() {
   const status = document.getElementById('status');
   try {
     const response = await fetch('/api/state?token=' + encodeURIComponent(token), { cache: 'no-store' });
     if (!response.ok) throw new Error('HTTP ' + response.status);
-    const state = await response.json();
-    document.getElementById('projects').replaceChildren(...state.projects.map(project));
-    status.textContent = state.projects.length ? 'Updated ' + new Date(state.generatedAt).toLocaleTimeString() + '; refreshes every 5 s.' : 'No projects yet. A project appears after its first Claude Code prompt.';
-    status.className = 'muted';
+    const fresh = JSON.parse(await response.text());
+    // Compare without generatedAt, which changes on every request; identical data keeps rows clickable.
+    const text = JSON.stringify({ ...fresh, generatedAt: null });
+    const active = document.activeElement;
+    const busy = (active && active.closest && active.closest('a, button, summary')) || String(getSelection()) !== '';
+    if (!data || (text !== lastText && !busy)) { lastText = text; data = fresh; render(); }
+    status.textContent = 'Updated ' + new Date(fresh.generatedAt).toLocaleTimeString() + '; refreshes every 5 s.';
+    status.className = 'muted small';
   } catch (error) {
     status.textContent = 'Refresh failed: ' + error.message;
-    status.className = 'bad';
+    status.className = 'pill error';
   }
 }
+window.addEventListener('hashchange', () => { render(); window.scrollTo(0, 0); });
 refresh();
 setInterval(refresh, 5000);
 </script>
