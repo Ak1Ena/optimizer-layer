@@ -51,6 +51,7 @@ export function reduceEvent(state: SessionState | null, event: Event): SessionSt
     case 'command.observed': return { ...state, evidence: [...state.evidence, payload.evidence], control: payload.control, failureStreak: payload.failureStreak };
     case 'strategy.resolved': return { ...state, control: payload.control, failureStreak: { signature: '', count: 0 }, completionClaimed: false };
     case 'completion.claimed': return { ...state, completionClaimed: true };
+    case 'session.replaced': return state;
     default: { const exhaustive: never = payload; return exhaustive; }
   }
 }

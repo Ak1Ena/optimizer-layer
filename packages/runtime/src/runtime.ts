@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { Store } from './store.ts';
 import { extractGoal, assessGate, nextAction, verifiedRequirementIds } from './intelligence.ts';
-import { importConversation, isContextCurrent, projectDigest, retrieveContext } from './context.ts';
+import { capturedPrompts, importConversation, isContextCurrent, projectDigest, retrieveContext, sourceDecisions } from './context.ts';
+import { readProjectConfig, writeProjectConfig } from './project.ts';
 import { nonempty, parseAssessment, parseChecks, parseReviewResponse } from './schema.ts';
 import { runCommand } from './process.ts';
 import { artifactsCurrent, registerArtifacts } from './verification.ts';
@@ -44,13 +45,13 @@ export class Runtime {
     const validChecks = new Set(state.checks.filter(artifactsCurrent).map(check => check.id));
     const superseded = new Set(state.decisions.flatMap(item => item.supersedes));
     const freshDecisionIds = new Set<string>();
-    const sources = new Map<string, ReturnType<typeof importConversation>>();
+    const sources = new Map<string, ReturnType<typeof sourceDecisions>>();
     for (const decision of state.decisions) {
       if (superseded.has(decision.id)) continue;
       try {
         let actual = sources.get(decision.source);
         if (!actual) {
-          actual = importConversation(this.projectRoot, decision.source);
+          actual = sourceDecisions(this.projectRoot, decision.source);
           sources.set(decision.source, actual);
         }
         if (actual.some(item => item.id === decision.id && item.digest === decision.digest && item.text === decision.text)) freshDecisionIds.add(decision.id);
@@ -76,11 +77,31 @@ export class Runtime {
     };
   }
 
-  start(input: { request: string; checks: unknown }): SessionState {
+  /** Without explicit checks, an enabled project's user-approved checks cover every requirement of the new goal. */
+  start(input: { request: string; checks?: unknown; replace?: boolean }): SessionState {
     const id = `session-${randomUUID()}`;
-    return this.#measure(id, 'start', () => {
+    const config = readProjectConfig(this.projectRoot);
+    const enabled = config?.enabled === true ? config : null;
+    if (input.checks === undefined && !enabled) throw new Error('--checks is required unless the project is enabled');
+    if (input.checks !== undefined && enabled) throw new Error('project checks come only from `optimizer enable`');
+    const active = enabled?.activeSessionId ?? null;
+    let replaced: string | null = null;
+    let unfinished = false;
+    try {
+      unfinished = active !== null && this.#store.events(active).length > 0 && this.next(active).kind !== 'complete';
+    } catch {
+      // An unreadable session cannot prove completion; it is replaceable.
+      unfinished = true;
+    }
+    if (active && unfinished) {
+      if (!input.replace) throw new Error(`Active session ${active} is not complete; pass --replace to start another`);
+      replaced = active;
+    }
+    const started = this.#measure(id, 'start', () => {
       const goal = extractGoal(nonempty(input.request, 'request'));
-      const checks = parseChecks(input.checks).map(check => registerArtifacts(this.projectRoot, check));
+      const checks = input.checks === undefined
+        ? (enabled?.checks ?? []).map(check => ({ ...check, requirementIds: goal.requirements.map(requirement => requirement.id) }))
+        : parseChecks(input.checks).map(check => registerArtifacts(this.projectRoot, check));
       const checkIds = new Set<string>();
       for (const check of checks) {
         if (checkIds.has(check.id)) throw new Error(`Duplicate check ID: ${check.id}`);
@@ -95,6 +116,15 @@ export class Runtime {
       this.#store.append({ version: 1, id: randomUUID(), sessionId: id, producer: 'runtime', at: new Date().toISOString(), payload: { kind: 'session.started', state } });
       return state;
     });
+    if (replaced) {
+      try {
+        this.#store.update(replaced, () => ({ kind: 'session.replaced', replacedBy: id }));
+      } catch {
+        // The old session's history is unreadable; the new active pointer still supersedes it.
+      }
+    }
+    if (enabled) writeProjectConfig(this.projectRoot, { ...enabled, activeSessionId: id });
+    return started;
   }
 
   get(sessionId: string): SessionState {
@@ -137,6 +167,15 @@ export class Runtime {
   }
 
   resolve(sessionId: string, input: { uncertaintyId: string; source: string; answer?: string }): SessionState {
+    if (input.source.startsWith('prompt:')) {
+      const stored = this.#store.get(sessionId);
+      if (stored.goal.uncertainties.find(item => item.id === input.uncertaintyId)?.owner === 'human' && !stored.decisions.some(item => item.id === input.source)) {
+        // Only rows the hook captured as user prompts carry human authority.
+        const decision = capturedPrompts(this.projectRoot).find(item => item.id === input.source);
+        if (!decision) throw new Error('Unknown hook-captured user prompt');
+        this.#measure(sessionId, 'import-prompt', () => this.#store.update(sessionId, () => ({ kind: 'conversation.imported', decisions: [decision] })));
+      }
+    }
     return this.#measure(sessionId, 'resolve', () => this.#store.update(sessionId, stored => {
       const question = stored.goal.uncertainties.find(item => item.id === input.uncertaintyId);
       if (!question) throw new Error('Unknown uncertainty');
@@ -145,7 +184,7 @@ export class Runtime {
         const superseded = new Set(stored.decisions.flatMap(item => item.supersedes));
         const decision = stored.decisions.find(item => item.id === input.source && !superseded.has(item.id));
         if (!decision) throw new Error('Human uncertainty requires an active imported user decision');
-        const actual = importConversation(this.projectRoot, decision.source);
+        const actual = sourceDecisions(this.projectRoot, decision.source);
         if (!actual.some(item => item.id === decision.id && item.digest === decision.digest)) throw new Error('Human decision source is stale');
         answer = decision.text;
       } else {

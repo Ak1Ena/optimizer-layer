@@ -2,18 +2,24 @@
 import { readFileSync, statSync } from 'node:fs';
 import { parseArgs, type ParseArgsOptionsConfig } from 'node:util';
 import { Runtime } from './runtime.ts';
+import { capturePrompt, disableProject, enableProject, readProjectConfig, sessionSummary } from './project.ts';
 import { parseAssessment, parseReviewResponse } from './schema.ts';
 
 const usage = `optimizer COMMAND --project PATH [--session ID]
 Commands:
   init
-  start       --request GOAL.md --checks CHECKS.json
+  enable      --check CMD [--check CMD ...] [--timeout-ms N]
+              [--yes accepts the package.json test script when --check is omitted]
+  disable
+  prompt      --file PROMPT.txt (hook capture; requires OPTIMIZER_HOOK_TOKEN)
+  current
+  start       --request GOAL.md [--checks CHECKS.json, optional when enabled] [--replace]
   history     --file CONVERSATION.jsonl
   retrieve
   assess      --kind sufficient|insufficient --rationale TEXT --items ID,ID
   review      --kind accept|challenge --version N --rationale TEXT --items ID,ID
               [--requirement ID --owner human|local for challenges]
-  resolve     --question ID --source DECISION_ID [--answer TEXT for local questions]
+  resolve     --question ID --source DECISION_ID|prompt:ID [--answer TEXT for local questions]
   next
   check       --check CHECK_ID
   reconsider  --strategy retain|revise --rationale TEXT
@@ -23,6 +29,7 @@ Commands:
   events      [--after SEQUENCE] [--limit COUNT]
   metrics
 All commands emit JSON. Goal/check/history files are explicitly selected inputs.
+Check commands for enable run without a shell; shell metacharacters are rejected.
 `;
 
 function readInput(path: string): string {
@@ -40,9 +47,10 @@ function pageNumber(value: string, name: string, maximum: number): number {
 function main(): unknown {
   const options: ParseArgsOptionsConfig = Object.fromEntries([
     'project', 'session', 'request', 'checks', 'file', 'kind', 'rationale', 'items',
-    'question', 'source', 'answer', 'check', 'strategy', 'after', 'limit', 'version', 'requirement', 'owner',
+    'question', 'source', 'answer', 'strategy', 'after', 'limit', 'version', 'requirement', 'owner', 'timeout-ms',
   ].map(name => [name, { type: 'string' }]));
-  options.help = { type: 'boolean' };
+  options.check = { type: 'string', multiple: true };
+  for (const name of ['help', 'yes', 'replace']) options[name] = { type: 'boolean' };
   const parsed = parseArgs({ allowPositionals: true, strict: true, options });
   if (parsed.values.help) {
     process.stdout.write(usage);
@@ -50,20 +58,43 @@ function main(): unknown {
   }
   const [command, ...extra] = parsed.positionals;
   if (extra.length) throw new Error('Unexpected positional arguments');
-  const commands = new Set(['init', 'start', 'history', 'retrieve', 'assess', 'review', 'resolve', 'next', 'check', 'reconsider', 'claim', 'verify', 'status', 'events', 'metrics']);
+  const commands = new Set(['init', 'enable', 'disable', 'prompt', 'current', 'start', 'history', 'retrieve', 'assess', 'review', 'resolve', 'next', 'check', 'reconsider', 'claim', 'verify', 'status', 'events', 'metrics']);
   if (!command || !commands.has(command)) throw new Error(`Unknown command: ${command ?? '(missing)'}`);
   const required = (name: string): string => {
-    const value = parsed.values[name];
+    const input = parsed.values[name];
+    const value = Array.isArray(input) && input.length === 1 ? input[0] : input;
     if (typeof value !== 'string' || !value.trim()) throw new Error(`--${name} is required`);
     return value;
   };
   const project = required('project');
+  if (command === 'enable') {
+    const checks = parsed.values.check;
+    const timeout = parsed.values['timeout-ms'];
+    return enableProject(project, {
+      commands: Array.isArray(checks) ? checks.filter(item => typeof item === 'string') : [],
+      timeoutMs: typeof timeout === 'string' ? pageNumber(timeout, 'timeout-ms', 30_000) : 30_000,
+      yes: parsed.values.yes === true,
+    });
+  }
+  if (command === 'disable') return disableProject(project);
+  if (command === 'prompt') return capturePrompt(project, readInput(required('file')), process.env.OPTIMIZER_HOOK_TOKEN);
+  if (command === 'current') {
+    const config = readProjectConfig(project);
+    if (!config?.enabled) return { enabled: false, sessionId: null, action: null, summary: '' };
+    if (!config.activeSessionId) return { enabled: true, sessionId: null, action: null, summary: 'No active optimizer session.' };
+  }
   const runtime = new Runtime(project);
   try {
     if (command === 'init') return { projectRoot: runtime.projectRoot };
+    if (command === 'current') {
+      const sessionId = readProjectConfig(project)?.activeSessionId;
+      if (!sessionId) throw new Error('No active session');
+      const action = runtime.next(sessionId);
+      return { enabled: true, sessionId, action, summary: sessionSummary(runtime.get(sessionId), action) };
+    }
     if (command === 'start') {
-      const checks: unknown = JSON.parse(readInput(required('checks')));
-      return runtime.start({ request: readInput(required('request')), checks });
+      const checks: unknown = typeof parsed.values.checks === 'string' ? JSON.parse(readInput(required('checks'))) : undefined;
+      return runtime.start({ request: readInput(required('request')), ...(checks === undefined ? {} : { checks }), replace: parsed.values.replace === true });
     }
     const sessionId = required('session');
     switch (command) {

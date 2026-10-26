@@ -31,7 +31,7 @@ The runtime owns state and policy. Adapters and MCP use its public interfaces. E
 
 Implemented: structured goal extraction, versioned contract review and challenge, bounded lexical context retrieval, provenance-aware decision import, context sufficiency assessment, durable event replay, cooperative reconsideration, and independent registered-command verification.
 
-The shipped integration uses explicit skill/CLI checkpoints. The runtime can gate its own checks; the working agent must honor clarification and pause requests during its other work. Native host hooks, automatic tool interception, and hosted Claude Code/Codex integration have not been verified.
+The shipped integrations are explicit skill/CLI checkpoints and opt-in Claude Code hooks (below). The runtime can gate its own checks. The hooks deny file-edit tools and block ending a turn according to the runtime's next action; they are tested with real hook JSON on stdin, not yet in a live Claude Code session. Bash file edits are not intercepted, and Codex hooks are not implemented.
 
 Broader natural-language interpretation through a replaceable model provider, richer code relationships, native conversation import, and repeated comparative evaluation remain future work. The current goal syntax and limits are documented below.
 
@@ -146,7 +146,28 @@ optimizer metrics --project /absolute/project --session SESSION
 
 Two reconsideration rounds are allowed; persistent failure then escalates to the human. `claim` never proves success. Verification detects stale source/check evidence and source mutations during a check. Independent verifier file hashes are pinned at registration. Helpers outside argv should be explicitly registered as artifacts. This does not defend against a malicious process with the same OS account modifying the optimizer itself.
 
-Install the adapter's [checkpoint skill](packages/adapter/skill/optimizer-checkpoint/SKILL.md) in the coding agent's skill directory using its normal local installation mechanism. Installation is explicit; the runtime does not rewrite host configuration. See [adapter documentation](packages/adapter/README.md). This is a cooperative skill/CLI integration; it does not advertise automatic native hooks or preemptive host interruption.
+Install the adapter's [checkpoint skill](packages/adapter/skill/optimizer-checkpoint/SKILL.md) in the coding agent's skill directory using its normal local installation mechanism. Installation is explicit; the runtime does not rewrite host configuration. See [adapter documentation](packages/adapter/README.md). For Claude Code, the opt-in hooks below replace typing these checkpoints by hand.
+
+## Claude Code hooks
+
+The adapter's `optimizer-claude-hook` lets you chat in plain language while the runtime keeps the agent on a goal contract. One-time machine setup (writes `settings.json.optimizer-backup` first, idempotent, preserves other settings and hooks):
+
+```sh
+optimizer-claude-hook install                        # merges into ~/.claude/settings.json
+optimizer-claude-hook install --settings /path/settings.json
+optimizer-claude-hook uninstall                      # removes only its own entries
+```
+
+The installer pins the current Node.js executable and the runtime executable (`OPTIMIZER_BIN`, else `optimizer` on `PATH`) into the hook command. Hooks do nothing until a project is enabled. You run this yourself, which is your approval of the check commands:
+
+```sh
+optimizer enable --project . --check 'npm test' [--check 'node test/acceptance.mjs'] [--timeout-ms 30000]
+optimizer disable --project .                        # keeps history
+```
+
+Check commands are split into argv without a shell; the shell metacharacters ``| ; & $ > < ` `` are rejected, and the executable is resolved to an absolute path at enable time. Without `--check`, a `package.json` test script is proposed and needs `--yes`. Each project check covers every requirement of every task.
+
+Then chat normally. On each prompt the hook captures your message into `.optimizer/prompts.jsonl` and injects the current contract state. With no open contract, Claude drafts one under `.optimizer/drafts/`, shows it, and runs `optimizer start --project P --request DRAFT` after you approve (`--replace` supersedes an unfinished session). Edit tools are denied while there is no contract or while the action is clarify, review, retrieve, reconsider, or escalate. Stop is blocked while a started task is unverified, at most three consecutive times and never twice for unchanged state. A captured prompt can answer a human question with `optimizer resolve --question Q1 --source prompt:ID`; only rows written by the hook's `prompt` capture, which needs the per-project hook token, carry that authority. A same-user agent could still read the token and call the runtime directly; the Bash matcher denies commands that mention `optimizer` or `cli.ts` together with the words `enable`, `disable` or `prompt`, and commands that mention `.optimizer` outside `.optimizer/drafts/`. This is a string match and best-effort only: an agent can still get around it, for example with a variable, an alias, or a script file, and the Read tool is not intercepted. Enabled projects reject `start --checks`; checks come only from `optimizer enable`. Hook infrastructure failures fail open with a one-line stderr diagnostic.
 
 ## Previous conversation decisions
 

@@ -115,7 +115,8 @@ export type EventPayload =
   | { kind: 'uncertainty.resolved'; uncertaintyId: string; answer: string; source: string }
   | { kind: 'command.observed'; evidence: VerificationEvidence; control: Control; failureStreak: SessionState['failureStreak'] }
   | { kind: 'strategy.resolved'; rationale: string; strategy: 'retain' | 'revise'; control: Control }
-  | { kind: 'completion.claimed' };
+  | { kind: 'completion.claimed' }
+  | { kind: 'session.replaced'; replacedBy: string };
 export interface Event {
   version: 1;
   id: string;

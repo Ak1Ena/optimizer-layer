@@ -1,5 +1,5 @@
-import { createHash } from 'node:crypto';
-import { closeSync, constants, lstatSync, openSync, opendirSync, readSync, realpathSync } from 'node:fs';
+import { createHash, randomUUID } from 'node:crypto';
+import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, opendirSync, readSync, realpathSync, writeSync } from 'node:fs';
 import type { Dirent } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { ContextItem, ContextSnapshot, Decision, Goal } from './types.ts';
@@ -263,7 +263,7 @@ function retrieveDecisions(root: string, goal: Goal, decisions: Decision[], cont
       // Authority comes from the transcript, not the caller's Decision object.
       let transcript = transcripts.get(decision.source);
       if (!transcript) {
-        transcript = new Map(importConversation(root, decision.source).map(candidate => [candidate.id, candidate]));
+        transcript = new Map(sourceDecisions(root, decision.source).map(candidate => [candidate.id, candidate]));
         transcripts.set(decision.source, transcript);
       }
       const verified = transcript.get(decision.id);
@@ -413,6 +413,60 @@ export function importConversation(projectRoot: string, path: string): Decision[
   return decisions;
 }
 
+export function promptLogPath(projectRoot: string): string {
+  return join(rootPath(projectRoot), '.optimizer', 'prompts.jsonl');
+}
+
+/** Append one hook-captured user prompt verbatim and return its row ID. */
+export function appendCapturedPrompt(projectRoot: string, content: string): string {
+  const root = rootPath(projectRoot);
+  if (!content.trim() || content.length > 200_000) throw new Error('Prompt must be nonempty and at most 200000 characters');
+  assertNoSymlinks(join(root, '.optimizer'));
+  const id = randomUUID();
+  const line = JSON.stringify({ id, projectRoot: root, role: 'user', content, timestamp: new Date().toISOString(), capturedBy: 'hook' }) + '\n';
+  const descriptor = openSync(promptLogPath(root), constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
+  try {
+    // shortcut: the log is capped at the transcript limit and capture stops when full; rotate once that happens in practice.
+    if (fstatSync(descriptor).size + Buffer.byteLength(line) > maxTranscriptBytes) throw new Error('Prompt log reached its size limit');
+    writeSync(descriptor, line);
+  } finally {
+    closeSync(descriptor);
+  }
+  return id;
+}
+
+/** Hook-captured user prompts are whole-message decisions; per-row digests keep earlier rows fresh as the log grows. */
+export function capturedPrompts(projectRoot: string): Decision[] {
+  const root = rootPath(projectRoot);
+  const source = promptLogPath(root);
+  if (!existsSync(source)) return [];
+  assertNoSymlinks(source);
+  const content = new TextDecoder('utf-8', { fatal: true }).decode(readSource(source, maxTranscriptBytes));
+  const decisions: Decision[] = [];
+  for (const [index, line] of content.split('\n').entries()) {
+    if (!line.trim()) continue;
+    let value: unknown;
+    let row: ConversationRow;
+    try {
+      value = JSON.parse(line);
+      row = parseRow(value);
+      if (rootPath(row.projectRoot) !== root) continue;
+    } catch {
+      // A bad row carries no authority, but must not disable capture or the hooks for the valid ones.
+      continue;
+    }
+    const hook = typeof value === 'object' && value !== null && 'capturedBy' in value && value.capturedBy === 'hook';
+    if (row.role !== 'user' || !hook || !row.content.trim()) continue;
+    const digest = createHash('sha256').update(line).digest('hex');
+    decisions.push({ id: `prompt:${row.id}`, text: row.content.trim(), source, line: index + 1, digest, timestamp: row.timestamp, role: 'user', supersedes: [] });
+  }
+  return decisions;
+}
+
+export function sourceDecisions(projectRoot: string, source: string): Decision[] {
+  return source === promptLogPath(projectRoot) ? capturedPrompts(projectRoot) : importConversation(projectRoot, source);
+}
+
 export function isContextCurrent(projectRoot: string, context: ContextSnapshot): boolean {
   try {
     const root = rootPath(projectRoot);
@@ -421,11 +475,14 @@ export function isContextCurrent(projectRoot: string, context: ContextSnapshot):
       if (!isAbsolute(item.path)) return false;
       if (item.kind !== 'decision' && !within(root, item.path)) return false;
       assertNoSymlinks(item.path);
-      if (digestFile(item.path) !== item.digest) return false;
-      if (item.kind !== 'decision') continue;
-      const decisions = activeDecisions(importConversation(root, item.path));
+      if (item.kind !== 'decision') {
+        if (digestFile(item.path) !== item.digest) return false;
+        continue;
+      }
+      // Transcript decisions carry the whole-file digest; captured prompts carry a per-row digest.
+      const decisions = activeDecisions(sourceDecisions(root, item.path));
       const matches = decisions.some(decision => {
-        return `decision:${decision.id}` === item.id && decision.text === item.excerpt && decision.line === item.line;
+        return `decision:${decision.id}` === item.id && decision.text === item.excerpt && decision.line === item.line && decision.digest === item.digest;
       });
       if (!matches) return false;
     }

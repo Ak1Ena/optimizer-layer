@@ -67,11 +67,18 @@ const payload = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('command.observed'), evidence, control, failureStreak: streak }).strict(),
   z.object({ kind: z.literal('strategy.resolved'), rationale: text, strategy: z.enum(['retain', 'revise']), control }).strict(),
   z.object({ kind: z.literal('completion.claimed') }).strict(),
+  z.object({ kind: z.literal('session.replaced'), replacedBy: id }).strict(),
 ]);
 const event = z.object({ version: z.literal(1), id, sessionId: id, producer: id, at: timestamp, payload }).strict();
 
+const projectConfig = z.object({
+  enabled: z.boolean(), hookToken: z.string().regex(/^[0-9a-f]{64}$/), checks: z.array(checkSchema).min(1).max(100), activeSessionId: id.nullable(),
+}).strict();
+export type ProjectConfig = z.infer<typeof projectConfig>;
+
 export function parseEvent(input: unknown): Event { return event.parse(input); }
 export function parseChecks(input: unknown) { return z.array(checkRegistration).max(100).parse(input); }
+export function parseProjectConfig(input: unknown): ProjectConfig { return projectConfig.parse(input); }
 export function parseAssessment(input: unknown): ContextAssessment { return assessment.parse(input); }
 export function parseReviewResponse(input: unknown): ReviewResponse { return reviewResponse.parse(input); }
 export function parseMeasurement(input: unknown): Measurement {
