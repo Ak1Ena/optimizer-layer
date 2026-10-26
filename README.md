@@ -31,7 +31,7 @@ npm install -g ./optimizer-layer-*.tgz
 
 To build from source instead: `npm ci && npm run build`, then `npm pack ./dist/npm/runtime ./dist/npm/adapter ./dist/npm/mcp` and install those tarballs.
 
-Maintainers publish a release by bumping the version in `packages/*/package.json` and pushing a matching tag (`git tag v0.2.0 && git push origin v0.2.0`). The [release workflow](.github/workflows/release.yml) runs tests, typecheck, lint and build, then creates a draft GitHub release with the tarballs. Publishing that draft on GitHub triggers the [npm-publish workflow](.github/workflows/npm-publish.yml), which verifies the checksums and publishes the same tarballs to npm with provenance when the repository has an `NPM_TOKEN` secret (skipped otherwise; versions already on npm are skipped). To publish an existing release, run the npm-publish workflow manually with its tag.
+Maintainers publish a release by bumping the version in `packages/*/package.json` and pushing a matching tag (`git tag v0.2.1 && git push origin v0.2.1`). The [release workflow](.github/workflows/release.yml) runs tests, typecheck, lint and build, then creates a draft GitHub release with the tarballs. Publishing that draft on GitHub triggers the [npm-publish workflow](.github/workflows/npm-publish.yml), which verifies the checksums and publishes the same tarballs to npm with provenance when the repository has an `NPM_TOKEN` secret (skipped otherwise; versions already on npm are skipped). To publish an existing release, run the npm-publish workflow manually with its tag.
 
 The binaries use `#!/usr/bin/env node`. If your default `node` is older than 24.18, run them through a wrapper that calls Node.js 24 explicitly, because older versions lack `node:sqlite`.
 

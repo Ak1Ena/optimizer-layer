@@ -15,7 +15,7 @@ function unavailable(): CallToolResult {
 }
 
 export function createServer(runtime: Runtime): McpServer {
-  const server = new McpServer({ name: 'optimizer-layer', version: '0.2.0' }, { maxToolInputElements: 10 });
+  const server = new McpServer({ name: 'optimizer-layer', version: '0.2.1' }, { maxToolInputElements: 10 });
   server.registerTool('optimizer_session_status', {
     description: 'Read sanitized current session status in the configured project. Returns counts and action/control kinds; excludes goal text, paths, commands, output, rationale, and other free text.',
     inputSchema: z.object({ sessionId }).strict(),
