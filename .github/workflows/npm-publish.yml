@@ -1,14 +1,8 @@
 name: npm-publish
 
 on:
-  workflow_call:
-    inputs:
-      tag:
-        required: true
-        type: string
-    secrets:
-      NPM_TOKEN:
-        required: false
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag:
@@ -24,7 +18,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-      TAG: ${{ inputs.tag }}
+      TAG: ${{ inputs.tag || github.event.release.tag_name }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - name: Skip without token
