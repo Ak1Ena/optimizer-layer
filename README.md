@@ -35,15 +35,16 @@ Maintainers publish a release by bumping the version in `packages/*/package.json
 
 The binaries use `#!/usr/bin/env node`. If your default `node` is older than 24.18, run them through a wrapper that calls Node.js 24 explicitly, because older versions lack `node:sqlite`.
 
-**2. Install the Claude Code hooks (once per machine).**
+**2. Install the Claude Code hooks (once per machine).** Pick one mode:
 
 ```sh
-optimizer-claude-hook install
+optimizer-claude-hook install               # opt-in (default): only folders you enable in step 3
+optimizer-claude-hook install --always-on   # global: every folder, no enable step
 ```
 
-This merges hook entries into `~/.claude/settings.json`, writing `settings.json.optimizer-backup` first and keeping your other settings and hooks. A `SessionStart` entry runs `optimizer-claude-hook ensure`, which silently repairs the other entries if something removed them, keeping the mode you installed. Remove everything with `optimizer-claude-hook uninstall`. Start a new Claude Code session afterwards.
+Run either command again to switch modes. This merges hook entries into `~/.claude/settings.json`, writing `settings.json.optimizer-backup` first and keeping your other settings and hooks. A `SessionStart` entry runs `optimizer-claude-hook ensure`, which silently repairs the other entries if something removed them, keeping the mode you installed. Remove everything with `optimizer-claude-hook uninstall`. Start a new Claude Code session afterwards.
 
-**3. Turn it on per project.** The default install is opt-in: the hooks do nothing in a folder until you enable it.
+**3. Turn it on per project (opt-in only; skip with `--always-on`).** The hooks do nothing in a folder until you enable it.
 
 ```sh
 cd /path/to/project
@@ -52,7 +53,7 @@ optimizer enable --project .
 
 This creates `.optimizer/` there and, inside a git repository, adds `.optimizer/` to `.git/info/exclude` so it never shows up in `git status`. Sessions in subfolders use the nearest parent with `.optimizer/`. In every other folder the hooks stay silent and create nothing.
 
-To have the optimizer on in every folder without `enable`, install with `optimizer-claude-hook install --always-on` instead. The first prompt in a folder then creates `.optimizer/` there. Running `optimizer-claude-hook install` again switches back to opt-in.
+With `--always-on`, the first prompt in any folder creates `.optimizer/` there instead.
 
 **4. Chat normally.**
 
