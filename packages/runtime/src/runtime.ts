@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { Store } from './store.ts';
 import { extractGoal, assessGate, nextAction, verifiedRequirementIds } from './intelligence.ts';
 import { capturedPrompts, importConversation, isContextCurrent, projectDigest, retrieveContext, sourceDecisions } from './context.ts';
-import { readProjectConfig, writeProjectConfig } from './project.ts';
+import { assertSafeArgv, readProjectConfig, writeProjectConfig } from './project.ts';
 import { nonempty, parseAssessment, parseChecks, parseReviewResponse } from './schema.ts';
 import { runCommand } from './process.ts';
 import { artifactsCurrent, registerArtifacts } from './verification.ts';
@@ -77,13 +77,15 @@ export class Runtime {
     };
   }
 
-  /** Without explicit checks, an enabled project's user-approved checks cover every requirement of the new goal. */
+  /** Without explicit checks, the project's user-approved checks cover every requirement of the new goal. */
   start(input: { request: string; checks?: unknown; replace?: boolean }): SessionState {
     const id = `session-${randomUUID()}`;
     const config = readProjectConfig(this.projectRoot);
     const enabled = config?.enabled === true ? config : null;
-    if (input.checks === undefined && !enabled) throw new Error('--checks is required unless the project is enabled');
-    if (input.checks !== undefined && enabled) throw new Error('project checks come only from `optimizer enable`');
+    if (input.checks !== undefined && config) throw new Error('Project checks come only from user approval (`optimizer propose-check` or `optimizer enable`)');
+    if (input.checks === undefined && !enabled?.checks.length) {
+      throw new Error('No approved project checks; run `optimizer propose-check --project P --check CMD` and have the user approve it, or pass --checks for a project without optimizer hook state');
+    }
     const active = enabled?.activeSessionId ?? null;
     let replaced: string | null = null;
     let unfinished = false;
@@ -97,6 +99,7 @@ export class Runtime {
       if (!input.replace) throw new Error(`Active session ${active} is not complete; pass --replace to start another`);
       replaced = active;
     }
+    for (const check of enabled?.checks ?? []) assertSafeArgv(check.argv);
     const started = this.#measure(id, 'start', () => {
       const goal = extractGoal(nonempty(input.request, 'request'));
       const checks = input.checks === undefined
@@ -137,7 +140,13 @@ export class Runtime {
       if (state.checks.some(check => !artifactsCurrent(check))) {
         return { kind: 'escalate', route: 'human', reason: 'Registered verifier artifacts changed; an operator must register a new contract.' } as const;
       }
-      return nextAction(state);
+      const action = nextAction(state);
+      if (action.kind === 'complete' && !this.#readOnly) {
+        // A verified session releases the pointer, so hooks take the no-spawn path again.
+        const config = readProjectConfig(this.projectRoot);
+        if (config?.activeSessionId === sessionId) writeProjectConfig(this.projectRoot, { ...config, activeSessionId: null });
+      }
+      return action;
     });
   }
 
@@ -230,6 +239,11 @@ export class Runtime {
       if (gate.kind !== 'proceed') throw new Error(`${gate.kind}: ${gate.reason}`);
       const check = state.checks.find(item => item.id === checkId);
       if (!check) throw new Error('Unknown registered check');
+      const config = readProjectConfig(this.projectRoot);
+      // Sessions in the runtime database can come from a committed file; with user-store approvals, only approved argv runs.
+      if (config && (!config.enabled || !config.checks.some(item => JSON.stringify([item.argv, item.timeoutMs]) === JSON.stringify([check.argv, check.timeoutMs])))) {
+        throw new Error('Check is not among the user-approved project checks, or the project is opted out');
+      }
       if (!artifactsCurrent(check)) throw new Error('Registered verifier artifact changed');
       const before = projectDigest(this.projectRoot);
       const result = runCommand({ argv: check.argv, cwd: this.projectRoot, timeoutMs: check.timeoutMs });
@@ -280,6 +294,7 @@ export class Runtime {
   }
 
   events(sessionId: string) { return this.#store.events(sessionId); }
+  sessions(): string[] { return this.#store.sessionIds(); }
   measurements(sessionId: string): Measurement[] { return this.#store.measurements(sessionId); }
   close(): void { this.#store.close(); }
 }

@@ -1,31 +1,70 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { accessSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from 'node:fs';
-import { delimiter, isAbsolute, join, resolve } from 'node:path';
+import { randomBytes } from 'node:crypto';
+import { accessSync, appendFileSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, statSync } from 'node:fs';
+import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { appendCapturedPrompt } from './context.ts';
-import { parseChecks, parseProjectConfig, type ProjectConfig } from './schema.ts';
+import { parseChecks, parseRegistry, type ProjectConfig } from './schema.ts';
+import { canonicalRoot, readProjectConfig, sameSecret, userStoreDirectory, writeAtomic, writeProjectConfig } from './user-store.ts';
+
+export { readProjectConfig, writeProjectConfig } from './user-store.ts';
 import { registerArtifacts } from './verification.ts';
 import type { NextAction, SessionState } from './types.ts';
 
-function configPath(projectRoot: string): string {
-  return join(realpathSync(projectRoot), '.optimizer', 'project.json');
+export function registryPath(): string {
+  return join(userStoreDirectory(), 'projects.json');
 }
 
-export function readProjectConfig(projectRoot: string): ProjectConfig | null {
-  const path = configPath(projectRoot);
-  if (!existsSync(path)) return null;
-  if (lstatSync(path).isSymbolicLink()) throw new Error('Project config must not be a symlink');
-  const input: unknown = JSON.parse(readFileSync(path, 'utf8'));
-  return parseProjectConfig(input);
+export function registeredProjects(): string[] {
+  try {
+    return parseRegistry(JSON.parse(readFileSync(registryPath(), 'utf8'))).projects;
+  } catch {
+    // A missing or corrupt registry is rebuilt from scratch.
+    return [];
+  }
 }
 
-export function writeProjectConfig(projectRoot: string, config: ProjectConfig): void {
-  const path = configPath(projectRoot);
-  const directory = join(realpathSync(projectRoot), '.optimizer');
-  if (existsSync(directory) && lstatSync(directory).isSymbolicLink()) throw new Error('Runtime directory must not be a symlink');
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const temporary = `${path}.${process.pid}.tmp`;
-  writeFileSync(temporary, JSON.stringify(parseProjectConfig(config), null, 2) + '\n', { mode: 0o600 });
-  renameSync(temporary, path);
+function registerProject(root: string): void {
+  const projects = registeredProjects();
+  if (projects.includes(root)) return;
+  writeAtomic(registryPath(), { projects: [...projects, root] });
+}
+
+/** Keep runtime state out of `git status` through the repository's untracked exclude file, never a tracked .gitignore. */
+export function excludeFromGit(root: string): void {
+  for (let directory = root; ; directory = dirname(directory)) {
+    const dotGit = join(directory, '.git');
+    if (existsSync(dotGit)) {
+      let gitDirectory = dotGit;
+      if (statSync(dotGit).isFile()) {
+        // Worktrees and submodules point to their git directory; worktrees share the main exclude file.
+        const target = /^gitdir: (.+)$/m.exec(readFileSync(dotGit, 'utf8'))?.[1];
+        if (!target) return;
+        gitDirectory = resolve(directory, target.trim());
+        const common = join(gitDirectory, 'commondir');
+        if (existsSync(common)) gitDirectory = resolve(gitDirectory, readFileSync(common, 'utf8').trim());
+      }
+      const exclude = join(gitDirectory, 'info', 'exclude');
+      if (existsSync(exclude) && lstatSync(exclude).isSymbolicLink()) return;
+      const content = existsSync(exclude) ? readFileSync(exclude, 'utf8') : '';
+      if (content.split('\n').some(line => line.trim() === '.optimizer/')) return;
+      mkdirSync(dirname(exclude), { recursive: true });
+      appendFileSync(exclude, `${content && !content.endsWith('\n') ? '\n' : ''}.optimizer/\n`);
+      return;
+    }
+    if (dirname(directory) === directory) return;
+  }
+}
+
+/** Any folder is a project: its user-store config and hook token are created on first use. */
+function loadOrCreate(root: string): ProjectConfig {
+  const existing = readProjectConfig(root);
+  if (existing) return existing;
+  if (dirname(root) === root) throw new Error('The filesystem root cannot be an optimizer project');
+  // Side effects first, so a failure is retried on the next use instead of leaving an unregistered project.
+  excludeFromGit(root);
+  registerProject(root);
+  const config: ProjectConfig = { projectRoot: root, enabled: true, hookToken: randomBytes(32).toString('hex'), checks: [], activeSessionId: null, pendingChecks: null };
+  writeProjectConfig(root, config);
+  return config;
 }
 
 /** Split a user-typed check command into argv without a shell; shell syntax is rejected, never interpreted. */
@@ -69,8 +108,28 @@ export function commandArgv(command: string, projectRoot: string): [string, ...s
   throw new Error(`Check executable not found: ${name}`);
 }
 
+/** The same rules as a user-typed command, re-applied to stored argv before it is used. */
+export function assertSafeArgv(argv: readonly string[]): void {
+  const [name] = argv;
+  if (argv.some(item => /[|;&$><`]/.test(item))) throw new Error('Stored check argv must not contain shell metacharacters; approve it again with `optimizer propose-check`');
+  let executable = false;
+  try {
+    accessSync(name ?? '', constants.X_OK);
+    executable = isAbsolute(name ?? '') && statSync(name ?? '').isFile();
+  } catch {
+    executable = false;
+  }
+  if (!executable) throw new Error(`Stored check executable is not an absolute executable file: ${name ?? '(missing)'}`);
+}
+
+function checkDefinitions(commands: string[], root: string, timeoutMs: number) {
+  return parseChecks(commands.map((command, index) => ({
+    id: `check-${index + 1}`, requirementIds: ['*'], argv: commandArgv(command, root), timeoutMs,
+  })));
+}
+
 export function enableProject(projectRoot: string, input: { commands: string[]; timeoutMs: number; yes: boolean }) {
-  const root = realpathSync(projectRoot);
+  const root = canonicalRoot(projectRoot);
   let commands = input.commands;
   if (!commands.length) {
     const manifest = join(root, 'package.json');
@@ -81,30 +140,67 @@ export function enableProject(projectRoot: string, input: { commands: string[]; 
     if (!input.yes) throw new Error("No --check given. Proposed: --check 'npm test' (from package.json scripts.test). Re-run with --yes to accept it.");
     commands = ['npm test'];
   }
-  const checks = parseChecks(commands.map((command, index) => ({
-    id: `check-${index + 1}`, requirementIds: ['*'], argv: commandArgv(command, root), timeoutMs: input.timeoutMs,
-  }))).map(check => registerArtifacts(root, check));
-  const previous = readProjectConfig(root);
-  writeProjectConfig(root, {
-    enabled: true, hookToken: previous?.hookToken ?? randomBytes(32).toString('hex'), checks, activeSessionId: previous?.activeSessionId ?? null,
-  });
+  const checks = checkDefinitions(commands, root, input.timeoutMs).map(check => registerArtifacts(root, check));
+  writeProjectConfig(root, { ...loadOrCreate(root), enabled: true, checks, pendingChecks: null });
   return { projectRoot: root, enabled: true, checks: checks.map(({ id, argv, timeoutMs }) => ({ id, argv, timeoutMs })) };
 }
 
+/** The agent proposes; only a hook-captured user prompt quoting the code activates (see capturePrompt). */
+export function proposeChecks(projectRoot: string, input: { commands: string[]; timeoutMs: number }) {
+  const root = canonicalRoot(projectRoot);
+  if (!input.commands.length) throw new Error('--check is required');
+  const definitions = checkDefinitions(input.commands, root, input.timeoutMs);
+  // Fail at proposal time, not when the user's approval prompt arrives.
+  for (const definition of definitions) registerArtifacts(root, definition);
+  const checks = definitions.map(({ artifactFiles: _, ...check }) => check);
+  const config = loadOrCreate(root);
+  if (!config.enabled) throw new Error('Project is disabled');
+  const code = randomBytes(2).toString('hex');
+  writeProjectConfig(root, { ...config, pendingChecks: { code, checks } });
+  return { projectRoot: root, code, approval: `approve check ${code}`, checks: checks.map(({ id, argv, timeoutMs }) => ({ id, argv, timeoutMs })) };
+}
+
 export function disableProject(projectRoot: string) {
-  const config = readProjectConfig(projectRoot);
-  if (!config) throw new Error('Project is not enabled');
-  writeProjectConfig(projectRoot, { ...config, enabled: false });
-  return { projectRoot: realpathSync(projectRoot), enabled: false };
+  const root = canonicalRoot(projectRoot);
+  writeProjectConfig(root, { ...loadOrCreate(root), enabled: false });
+  return { projectRoot: root, enabled: false };
+}
+
+function approvalCodes(content: string): string[] {
+  return [...content.matchAll(/\bapprove\s+check\s+([0-9a-f]{4})\b/gi)].map(match => (match[1] ?? '').toLowerCase());
 }
 
 export function capturePrompt(projectRoot: string, content: string, token: string | undefined) {
-  const config = readProjectConfig(projectRoot);
-  if (!config?.enabled) throw new Error('Project is not enabled');
-  const expected = Buffer.from(config.hookToken);
-  const actual = Buffer.from(token ?? '');
-  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) throw new Error('prompt requires the hook token');
-  return { id: appendCapturedPrompt(projectRoot, content) };
+  const root = canonicalRoot(projectRoot);
+  const existing = readProjectConfig(root);
+  // The first capture creates the user-store token, so only a same-user process can make it; repository content never supplies one.
+  const config = existing ?? loadOrCreate(root);
+  if (!config.enabled) throw new Error('Project is disabled');
+  if (existing && !sameSecret(token ?? '', config.hookToken)) throw new Error('prompt requires the hook token');
+  const directory = join(root, '.optimizer');
+  if (existsSync(directory) && lstatSync(directory).isSymbolicLink()) throw new Error('Runtime directory must not be a symlink');
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const id = appendCapturedPrompt(root, content, config.hookToken);
+  const pending = config.pendingChecks;
+  if (pending === null || !approvalCodes(content).includes(pending.code)) return { id, checkApproved: false };
+  // The prompt row is already recorded; a failed activation must not lose it.
+  try {
+    const checks = parseChecks(pending.checks).map(check => registerArtifacts(root, check));
+    writeProjectConfig(root, { ...config, checks, pendingChecks: null });
+    return { id, checkApproved: true };
+  } catch (error) {
+    return { id, checkApproved: false, approvalError: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+/** What hooks and the dashboard may show about a project; the hook token never leaves the config file. */
+export function projectView(config: ProjectConfig | null) {
+  return {
+    enabled: config?.enabled ?? true,
+    checks: (config?.checks ?? []).map(check => check.argv),
+    pendingChecks: config?.pendingChecks ? { code: config.pendingChecks.code, argv: config.pendingChecks.checks.map(check => check.argv) } : null,
+    activeSessionId: config?.activeSessionId ?? null,
+  };
 }
 
 export function sessionSummary(state: SessionState, action: NextAction): string {

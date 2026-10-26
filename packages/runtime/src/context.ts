@@ -3,6 +3,7 @@ import { closeSync, constants, existsSync, fstatSync, lstatSync, openSync, opend
 import type { Dirent } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { ContextItem, ContextSnapshot, Decision, Goal } from './types.ts';
+import { promptMac, readProjectConfig, sameSecret } from './user-store.ts';
 
 const excludedDirectories = new Set([
   '.git', '.optimizer', 'node_modules', '.aws', '.codex', '.agents',
@@ -417,13 +418,14 @@ export function promptLogPath(projectRoot: string): string {
   return join(rootPath(projectRoot), '.optimizer', 'prompts.jsonl');
 }
 
-/** Append one hook-captured user prompt verbatim and return its row ID. */
-export function appendCapturedPrompt(projectRoot: string, content: string): string {
+/** Append one hook-captured user prompt verbatim, authenticated with the user-store token, and return its row ID. */
+export function appendCapturedPrompt(projectRoot: string, content: string, token: string): string {
   const root = rootPath(projectRoot);
   if (!content.trim() || content.length > 200_000) throw new Error('Prompt must be nonempty and at most 200000 characters');
   assertNoSymlinks(join(root, '.optimizer'));
-  const id = randomUUID();
-  const line = JSON.stringify({ id, projectRoot: root, role: 'user', content, timestamp: new Date().toISOString(), capturedBy: 'hook' }) + '\n';
+  const row = { id: randomUUID(), projectRoot: root, role: 'user', content, timestamp: new Date().toISOString() };
+  const id = row.id;
+  const line = JSON.stringify({ ...row, capturedBy: 'hook', mac: promptMac(token, row) }) + '\n';
   const descriptor = openSync(promptLogPath(root), constants.O_WRONLY | constants.O_APPEND | constants.O_CREAT | constants.O_NOFOLLOW, 0o600);
   try {
     // shortcut: the log is capped at the transcript limit and capture stops when full; rotate once that happens in practice.
@@ -440,6 +442,9 @@ export function capturedPrompts(projectRoot: string): Decision[] {
   const root = rootPath(projectRoot);
   const source = promptLogPath(root);
   if (!existsSync(source)) return [];
+  // Without the user-store token no row can be authenticated; rows committed to a repository never qualify.
+  const token = readProjectConfig(root)?.hookToken;
+  if (!token) return [];
   assertNoSymlinks(source);
   const content = new TextDecoder('utf-8', { fatal: true }).decode(readSource(source, maxTranscriptBytes));
   const decisions: Decision[] = [];
@@ -455,7 +460,8 @@ export function capturedPrompts(projectRoot: string): Decision[] {
       // A bad row carries no authority, but must not disable capture or the hooks for the valid ones.
       continue;
     }
-    const hook = typeof value === 'object' && value !== null && 'capturedBy' in value && value.capturedBy === 'hook';
+    const hook = typeof value === 'object' && value !== null && 'capturedBy' in value && value.capturedBy === 'hook'
+      && 'mac' in value && typeof value.mac === 'string' && sameSecret(value.mac, promptMac(token, row));
     if (row.role !== 'user' || !hook || !row.content.trim()) continue;
     const digest = createHash('sha256').update(line).digest('hex');
     decisions.push({ id: `prompt:${row.id}`, text: row.content.trim(), source, line: index + 1, digest, timestamp: row.timestamp, role: 'user', supersedes: [] });

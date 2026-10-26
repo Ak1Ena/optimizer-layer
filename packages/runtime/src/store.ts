@@ -68,7 +68,10 @@ export class Store {
     if (existsSync(directory) && lstatSync(directory).isSymbolicLink()) throw new Error('Runtime directory must not be a symlink');
     if (!this.#readOnly) mkdirSync(directory, { recursive: true, mode: 0o700 });
     const path = join(directory, 'runtime.sqlite');
-    if (existsSync(path) && lstatSync(path).isSymbolicLink()) throw new Error('Runtime database must not be a symlink');
+    for (const file of [path, `${path}-wal`, `${path}-shm`, `${path}-journal`]) {
+      // SQLite writes these companions too; a planted symlink would redirect the writes.
+      if (existsSync(file) && lstatSync(file).isSymbolicLink()) throw new Error('Runtime database must not be a symlink');
+    }
     if (this.#readOnly && !existsSync(path)) throw new Error('Project runtime is not initialized');
     this.#db = new DatabaseSync(path, { readOnly: this.#readOnly });
     try {
@@ -169,6 +172,11 @@ export class Store {
       const input: unknown = JSON.parse(row.body);
       return { sequence: row.sequence, event: parseEvent(input) };
     });
+  }
+
+  /** Session IDs, most recently started first. */
+  sessionIds(): string[] {
+    return this.#db.prepare('SELECT session_id FROM events GROUP BY session_id ORDER BY MIN(sequence) DESC').all().map(row => String(row.session_id));
   }
 
   measure(sessionId: string, measurement: Measurement): void {

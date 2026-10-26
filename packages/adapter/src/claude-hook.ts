@@ -1,14 +1,15 @@
 #!/usr/bin/env node
-import { accessSync, constants, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { accessSync, closeSync, constants, copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync, writeSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { runOptimizer, type OptimizerCommand } from './index.ts';
 
 type Output = Record<string, unknown> | undefined;
 type Action = { kind: string; reason: string; uncertaintyIds?: unknown };
-interface Current { sessionId: string | null; action: Action | null; summary: string }
+interface Current { sessionId: string | null; action: Action | null; summary: string; checks: string[][]; pending: { code: string; argv: string[][] } | null }
 
 const script = fileURLToPath(import.meta.url);
 const editMatcher = 'Edit|Write|MultiEdit|NotebookEdit|Bash';
@@ -53,22 +54,38 @@ function real(path: string): string {
   }
 }
 
+/** Any folder is a project: the nearest ancestor that already has .optimizer/, else cwd; never the filesystem root or runtime state itself. */
 function findRoot(cwd: string): string | null {
-  const home = homedir();
-  for (let directory = resolve(cwd); directory !== home; directory = dirname(directory)) {
-    if (existsSync(join(directory, '.optimizer', 'project.json'))) return realpathSync.native(directory);
-    if (dirname(directory) === directory) return null;
+  const parts = resolve(cwd).split(sep);
+  const inside = parts.indexOf('.optimizer');
+  const start = inside === -1 ? resolve(cwd) : parts.slice(0, inside).join(sep) || sep;
+  const home = resolve(homedir());
+  for (let directory = start; dirname(directory) !== directory; directory = dirname(directory)) {
+    // A home-directory project applies only in home itself; otherwise it would absorb every project below it.
+    if (directory === home && directory !== start) break;
+    if (existsSync(join(directory, '.optimizer'))) return realpathSync.native(directory);
   }
-  return null;
+  return dirname(start) === start ? null : realpathSync.native(start);
 }
 
-function hookToken(root: string): string | null {
+/** Mirrors the runtime's per-user store; a project.json inside the project is never trusted. */
+function userStore(): string {
+  const base = process.env.XDG_CONFIG_HOME;
+  return join(base && isAbsolute(base) ? base : join(homedir(), '.config'), 'optimizer-layer');
+}
+
+function readConfig(root: string): Record<string, unknown> | null {
   try {
-    const config: unknown = JSON.parse(readFileSync(join(root, '.optimizer', 'project.json'), 'utf8'));
-    return isRecord(config) && config.enabled === true ? text(config.hookToken) ?? null : null;
+    const path = join(userStore(), 'projects', `${createHash('sha256').update(root).digest('hex')}.json`);
+    const config: unknown = JSON.parse(readFileSync(path, 'utf8'));
+    return isRecord(config) && config.projectRoot === root ? config : null;
   } catch {
     return null;
   }
+}
+
+function argvList(value: unknown): string[][] {
+  return Array.isArray(value) ? value.filter(item => Array.isArray(item)).map(item => item.map(String)) : [];
 }
 
 function call(root: string, command: OptimizerCommand, options: Record<string, string> = {}): Record<string, unknown> {
@@ -84,21 +101,25 @@ function call(root: string, command: OptimizerCommand, options: Record<string, s
 function current(root: string): Current {
   const value = call(root, 'current');
   const action = value.action;
+  const pending = value.pendingChecks;
   return {
     sessionId: text(value.sessionId) ?? null,
     action: isRecord(action) && typeof action.kind === 'string' && typeof action.reason === 'string' ? { kind: action.kind, reason: action.reason, uncertaintyIds: action.uncertaintyIds } : null,
     summary: text(value.summary) ?? '',
+    checks: argvList(value.checks),
+    pending: isRecord(pending) && typeof pending.code === 'string' ? { code: pending.code, argv: argvList(pending.argv) } : null,
   };
 }
 
-function capture(root: string, prompt: string): string {
+function capture(root: string, prompt: string): { id: string; checkApproved: boolean; approvalError: string | undefined } {
   const directory = mkdtempSync(join(tmpdir(), 'optimizer-prompt-'));
   try {
     const file = join(directory, 'prompt.txt');
     writeFileSync(file, prompt, { mode: 0o600 });
-    const id = text(call(root, 'prompt', { file }).id);
+    const value = call(root, 'prompt', { file });
+    const id = text(value.id);
     if (!id) throw new Error('optimizer prompt returned no ID');
-    return id;
+    return { id, checkApproved: value.checkApproved === true, approvalError: text(value.approvalError) };
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
@@ -108,17 +129,27 @@ function userPromptSubmit(root: string, prompt: string): Output {
   let id = 'ID';
   const lines: string[] = [];
   try {
-    id = capture(root, prompt);
+    const captured = capture(root, prompt);
+    id = captured.id;
     lines.push(`optimizer: this user prompt was captured as prompt:${id}; it can be cited as a human decision source with --source prompt:${id}.`);
+    if (captured.checkApproved) lines.push('optimizer: with this prompt the user approved the proposed check commands; they are now the project checks.');
+    if (captured.approvalError) lines.push(`optimizer: the user typed the approval code, but the proposed checks could not be activated: ${captured.approvalError}. Propose a corrected check.`);
   } catch (error) {
     process.stderr.write(`optimizer-claude-hook: ${error instanceof Error ? error.message : String(error)}\n`.replaceAll(/\n(?!$)/g, ' '));
     lines.push('optimizer: this prompt could not be captured, so it cannot be cited as a human decision.');
   }
   const state = current(root);
+  const commands = (rows: string[][]) => rows.map(argv => `  ${JSON.stringify(argv)}`).join('\n');
+  if (state.pending) {
+    lines.push(`Pending check proposal (argv, run without a shell):\n${commands(state.pending.argv)}\nThe user approves it by replying with \`approve check ${state.pending.code}\`; nothing else activates it.`);
+  }
   if (!state.sessionId || !state.action || state.action.kind === 'complete') {
     lines.push(
-      `Project ${root} is optimizer-enabled and has no open goal contract.`,
-      `A request that changes files needs a contract first: draft it under ${root}/.optimizer/drafts/NAME.md in the dialect below, show the draft to the user with any open human questions, and only after the user explicitly approves run \`optimizer start --project ${root} --request ${root}/.optimizer/drafts/NAME.md\` (the user-approved project checks apply automatically).${state.sessionId ? '' : ' File edits outside drafts are denied until then.'}`,
+      `Project ${root} has no open optimizer goal contract; file edits are not gated.`,
+      `A request that changes files should get a contract first: draft it under ${root}/.optimizer/drafts/NAME.md in the dialect below, show the draft to the user with any open human questions, and only after the user explicitly approves run \`optimizer start --project ${root} --request ${root}/.optimizer/drafts/NAME.md\` (the user-approved project checks apply automatically).`,
+      state.checks.length
+        ? `Approved project checks:\n${commands(state.checks)}`
+        : `The project has no approved check commands yet, and start needs them. Propose the project's test command with \`optimizer propose-check --project ${root} --check CMD\` and show the user the returned argv and approval phrase.`,
       'Questions and explanations that change no files need no session.',
       dialect,
     );
@@ -138,27 +169,32 @@ function deny(reason: string): Output {
   return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: reason } };
 }
 
-function preToolUse(root: string, cwd: string, tool: string, input: Record<string, unknown>): Output {
+function preToolUse(root: string, cwd: string, tool: string, input: Record<string, unknown>, active: boolean): Output {
   if (tool === 'Bash') {
     // Best effort only: a same-user agent can reach the runtime by other spellings.
     const command = text(input.command) ?? '';
     const control = /optimizer|cli\.ts/.test(command) && /\b(enable|disable|prompt)\b(?!:)/.test(command);
-    return control || /optimizer-claude-hook|\.optimizer(?![\w-])(?!\/drafts\/)/.test(command) ? deny('optimizer: prompt capture, project enablement and runtime state belong to the user and the Claude Code hook.') : undefined;
+    return control || /optimizer-claude-hook|optimizer-layer\/projects|\.optimizer(?![\w-])(?!\/drafts\/)/.test(command) ? deny('optimizer: prompt capture, project enablement and runtime state belong to the user and the Claude Code hook.') : undefined;
   }
   const file = text(input.file_path) ?? text(input.notebook_path);
   if (!file) return undefined;
+  const store = relative(real(userStore()), real(resolve(cwd, file)));
+  if (store !== '..' && !store.startsWith(`..${sep}`) && !isAbsolute(store)) return deny('optimizer: approvals and hook tokens are written only by the optimizer runtime.');
   const target = relative(root, real(resolve(cwd, file)));
   if (target === '..' || target.startsWith(`..${sep}`) || isAbsolute(target)) return undefined;
   if (target.startsWith(join('.optimizer', 'drafts') + sep)) return undefined;
-  if (target === '.optimizer' || target.startsWith(`.optimizer${sep}`)) return deny('optimizer: runtime state is written only by the optimizer runtime and hook.');
+  // Any .optimizer segment: a nested project config written by the agent would otherwise become the root for that subfolder.
+  if (target.split(sep).includes('.optimizer')) return deny('optimizer: runtime state is written only by the optimizer runtime and hook.');
+  // Without an active session pointer edits are not gated, and the runtime is not spawned.
+  if (!active) return undefined;
   const state = current(root);
-  if (!state.sessionId || !state.action) return deny('No approved goal contract; draft it and get user approval first.');
+  if (!state.sessionId || !state.action) return undefined;
   if (blockingActions.has(state.action.kind)) return deny(`optimizer: ${state.action.kind}: ${state.action.reason} ${instructions[state.action.kind] ?? ''}`.trim());
   return undefined;
 }
 
-function stop(root: string, claudeSession: string, active: boolean): Output {
-  const state = current(root);
+function stop(root: string, claudeSession: string, active: boolean, session: boolean): Output {
+  const state = session ? current(root) : { sessionId: null, action: null, summary: '' };
   const statePath = join(root, '.optimizer', 'hook-state.json');
   let hookState: Record<string, unknown> = {};
   try {
@@ -167,7 +203,16 @@ function stop(root: string, claudeSession: string, active: boolean): Output {
   } catch {
     // Missing or corrupt loop-guard state starts a fresh count.
   }
-  const save = () => writeFileSync(statePath, JSON.stringify(hookState) + '\n', { mode: 0o600 });
+  const save = () => {
+    // A cloned repository can plant symlinks in .optimizer/; never write through one.
+    if (lstatSync(join(root, '.optimizer')).isSymbolicLink()) throw new Error('Runtime directory must not be a symlink');
+    const descriptor = openSync(statePath, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW, 0o600);
+    try {
+      writeSync(descriptor, JSON.stringify(hookState) + '\n');
+    } finally {
+      closeSync(descriptor);
+    }
+  };
   const action = state.action;
   if (!state.sessionId || !action || action.kind === 'complete') {
     if (claudeSession in hookState) { delete hookState[claudeSession]; save(); }
@@ -196,11 +241,16 @@ function hook(raw: string): Output {
   if (!isRecord(input)) throw new Error('Hook input must be a JSON object');
   const cwd = text(input.cwd);
   if (!cwd || !isAbsolute(cwd)) throw new Error('Hook input needs an absolute cwd');
+  if (process.env.OPTIMIZER_DISABLED === '1') return undefined;
   const root = findRoot(cwd);
   if (!root) return undefined;
-  const token = hookToken(root);
-  if (!token) return undefined;
-  process.env.OPTIMIZER_HOOK_TOKEN = token;
+  const config = readConfig(root);
+  if (config?.enabled === false) return undefined;
+  const token = text(config?.hookToken);
+  // A project without config gets its token from the runtime at the first capture.
+  if (token) process.env.OPTIMIZER_HOOK_TOKEN = token;
+  else delete process.env.OPTIMIZER_HOOK_TOKEN;
+  const session = typeof config?.activeSessionId === 'string';
   // A `#!/usr/bin/env node` runtime binary must run on the hook's Node.js 24, not an older default node.
   process.env.PATH = `${dirname(process.execPath)}${delimiter}${process.env.PATH ?? ''}`;
   switch (input.hook_event_name) {
@@ -210,15 +260,17 @@ function hook(raw: string): Output {
     }
     case 'PreToolUse': {
       const tool = text(input.tool_name);
-      return tool && isRecord(input.tool_input) ? preToolUse(root, cwd, tool, input.tool_input) : undefined;
+      return tool && isRecord(input.tool_input) ? preToolUse(root, cwd, tool, input.tool_input, session) : undefined;
     }
-    case 'Stop': return stop(root, text(input.session_id) ?? '', input.stop_hook_active === true);
+    case 'Stop': return stop(root, text(input.session_id) ?? '', input.stop_hook_active === true, session);
     default: return undefined;
   }
 }
 
+/** Matches entries written by any install of this hook, including one whose paths have since moved. */
 function isOurs(hook: unknown): boolean {
-  return isRecord(hook) && typeof hook.command === 'string' && hook.command.includes(script);
+  return isRecord(hook) && typeof hook.command === 'string'
+    && (hook.command.includes(script) || /^OPTIMIZER_BIN='.*' '.*\/claude-hook\.[jt]s'(?: ensure --settings '.*')?$/.test(hook.command));
 }
 
 function withoutOurs(hooks: unknown): Record<string, unknown> {
@@ -259,17 +311,32 @@ function runtimeExecutable(): string {
   throw new Error('optimizer executable not found on PATH; set OPTIMIZER_BIN to its absolute path');
 }
 
-function configure(mode: 'install' | 'uninstall', path: string) {
-  const exists = existsSync(path);
-  if (mode === 'uninstall' && !exists) return { settings: path, mode, command: null };
-  const settings: unknown = exists ? JSON.parse(readFileSync(path, 'utf8')) : {};
+function entries(command: string, path: string): [string, Record<string, unknown>][] {
+  const entry = (line: string) => ({ hooks: [{ type: 'command', command: line }] });
+  return [
+    ['UserPromptSubmit', entry(command)],
+    ['PreToolUse', { matcher: editMatcher, ...entry(command) }],
+    ['Stop', entry(command)],
+    ['SessionStart', { matcher: 'startup|resume', ...entry(`${command} ensure --settings ${quote(path)}`) }],
+  ];
+}
+
+function readSettings(path: string): Record<string, unknown> | null {
+  if (!existsSync(path)) return null;
+  const settings: unknown = JSON.parse(readFileSync(path, 'utf8'));
   if (!isRecord(settings)) throw new Error('Claude Code settings must be a JSON object');
+  return settings;
+}
+
+function configure(mode: 'install' | 'uninstall', path: string) {
+  const existing = readSettings(path);
+  if (mode === 'uninstall' && !existing) return { settings: path, mode, command: null };
+  const settings = existing ?? {};
   const hooks = withoutOurs(settings.hooks);
   let command: string | null = null;
   if (mode === 'install') {
     command = `OPTIMIZER_BIN=${quote(runtimeExecutable())} ${quote(process.execPath)} ${quote(script)}`;
-    const entry = { hooks: [{ type: 'command', command }] };
-    for (const [event, group] of [['UserPromptSubmit', entry], ['PreToolUse', { matcher: editMatcher, ...entry }], ['Stop', entry]] as const) {
+    for (const [event, group] of entries(command, path)) {
       const groups = hooks[event];
       hooks[event] = [...(Array.isArray(groups) ? groups : []), group];
     }
@@ -277,25 +344,51 @@ function configure(mode: 'install' | 'uninstall', path: string) {
   const next: Record<string, unknown> = { ...settings, hooks };
   if (!Object.keys(hooks).length) delete next.hooks;
   // Keep the first backup: a later install would otherwise overwrite the original with already-merged settings.
-  if (exists && !existsSync(`${path}.optimizer-backup`)) copyFileSync(path, `${path}.optimizer-backup`);
+  if (existing && !existsSync(`${path}.optimizer-backup`)) copyFileSync(path, `${path}.optimizer-backup`);
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, JSON.stringify(next, null, 2) + '\n');
+  // Atomic, because ensure can run from several sessions starting at once.
+  const temporary = `${path}.${process.pid}.tmp`;
+  writeFileSync(temporary, JSON.stringify(next, null, 2) + '\n');
+  renameSync(temporary, path);
   return { settings: path, mode, command };
+}
+
+/** SessionStart repair: silent and unchanged when every entry is in place, otherwise a fresh install. */
+function ensure(path: string): boolean {
+  const settings = readSettings(path);
+  const hooks = isRecord(settings?.hooks) ? settings.hooks : {};
+  const expected = entries(`OPTIMIZER_BIN=${quote(runtimeExecutable())} ${quote(process.execPath)} ${quote(script)}`, path);
+  const ours = Object.values(hooks).flatMap(groups => Array.isArray(groups) ? groups : [])
+    .filter(group => isRecord(group) && Array.isArray(group.hooks) && group.hooks.some(isOurs));
+  const intact = ours.length === expected.length && expected.every(([event, group]) => {
+    const groups = hooks[event];
+    return Array.isArray(groups) && groups.some(item => JSON.stringify(item) === JSON.stringify(group));
+  });
+  if (intact) return false;
+  configure('install', path);
+  return true;
 }
 
 const parsed = parseArgs({ allowPositionals: true, options: { settings: { type: 'string' } } });
 const [mode, ...extra] = parsed.positionals;
-if (mode === 'install' || mode === 'uninstall') {
+const settingsPath = resolve(parsed.values.settings ?? join(homedir(), '.claude', 'settings.json'));
+if (mode === 'ensure') {
+  // SessionStart stdout becomes session context, so ensure prints nothing there and never fails the session.
+  try {
+    if (ensure(settingsPath)) process.stderr.write('optimizer-claude-hook: repaired hook entries\n');
+  } catch (error) {
+    process.stderr.write(`optimizer-claude-hook: ensure: ${error instanceof Error ? error.message : String(error)}\n`.replaceAll(/\n(?!$)/g, ' '));
+  }
+} else if (mode === 'install' || mode === 'uninstall') {
   try {
     if (extra.length) throw new Error('Unexpected positional arguments');
-    const settings = resolve(parsed.values.settings ?? join(homedir(), '.claude', 'settings.json'));
-    process.stdout.write(JSON.stringify(configure(mode, settings)) + '\n');
+    process.stdout.write(JSON.stringify(configure(mode, settingsPath)) + '\n');
   } catch (error) {
     process.stderr.write(JSON.stringify({ error: error instanceof Error ? error.message : String(error) }) + '\n');
     process.exitCode = 1;
   }
 } else if (mode !== undefined) {
-  process.stderr.write('Usage: optimizer-claude-hook [install|uninstall] [--settings PATH]; without a command it handles one Claude Code hook event on stdin.\n');
+  process.stderr.write('Usage: optimizer-claude-hook [install|uninstall|ensure] [--settings PATH]; without a command it handles one Claude Code hook event on stdin.\n');
   process.exitCode = 1;
 } else {
   // Never break Claude Code on hook infrastructure errors: fail open with a one-line diagnostic.

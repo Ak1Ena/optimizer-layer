@@ -12,7 +12,11 @@ export function registerArtifacts(projectRoot: string, check: ReturnType<typeof 
   const { artifactFiles, ...definition } = check;
   const paths = new Set(artifactFiles.map(path => resolve(projectRoot, path)));
   const executable = resolve(projectRoot, check.argv[0]);
-  if (executable !== process.execPath && existsSync(executable) && lstatSync(executable).isFile()) {
+  const executableChild = relative(projectRoot, executable);
+  const systemExecutable = executableChild === '..' || executableChild.startsWith(`..${sep}`) || isAbsolute(executableChild);
+  // Large executables outside the project are system interpreters such as node or python; repository binaries stay pinned.
+  if (executable !== process.execPath && existsSync(executable) && lstatSync(executable).isFile()
+    && !(systemExecutable && lstatSync(executable).size > 4 * 1024 * 1024)) {
     paths.add(executable);
   }
   let scriptFound = false;

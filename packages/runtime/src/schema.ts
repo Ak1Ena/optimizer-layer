@@ -72,7 +72,9 @@ const payload = z.discriminatedUnion('kind', [
 const event = z.object({ version: z.literal(1), id, sessionId: id, producer: id, at: timestamp, payload }).strict();
 
 const projectConfig = z.object({
-  enabled: z.boolean(), hookToken: z.string().regex(/^[0-9a-f]{64}$/), checks: z.array(checkSchema).min(1).max(100), activeSessionId: id.nullable(),
+  projectRoot: z.string().min(1).max(4096), enabled: z.boolean(), hookToken: z.string().regex(/^[0-9a-f]{64}$/), checks: z.array(checkSchema).max(100), activeSessionId: id.nullable(),
+  // Proposed by the agent; activated only by a hook-captured user prompt quoting the code.
+  pendingChecks: z.object({ code: z.string().regex(/^[0-9a-f]{4}$/), checks: z.array(checkDefinition).min(1).max(100) }).strict().nullable().default(null),
 }).strict();
 export type ProjectConfig = z.infer<typeof projectConfig>;
 
@@ -81,6 +83,9 @@ export function parseChecks(input: unknown) { return z.array(checkRegistration).
 export function parseProjectConfig(input: unknown): ProjectConfig { return projectConfig.parse(input); }
 export function parseAssessment(input: unknown): ContextAssessment { return assessment.parse(input); }
 export function parseReviewResponse(input: unknown): ReviewResponse { return reviewResponse.parse(input); }
+export function parseRegistry(input: unknown): { projects: string[] } {
+  return z.object({ projects: z.array(z.string().min(1).max(4096)) }).strict().parse(input);
+}
 export function parseMeasurement(input: unknown): Measurement {
   return z.object({ operation: text, elapsedMs: z.number().nonnegative(), externalMs: z.number().nonnegative(), optimizerMs: z.number().nonnegative(), at: timestamp }).strict().parse(input);
 }

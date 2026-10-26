@@ -33,31 +33,28 @@ The binaries use `#!/usr/bin/env node`. If your default `node` is older than 24.
 optimizer-claude-hook install
 ```
 
-This merges hook entries into `~/.claude/settings.json`, writing `settings.json.optimizer-backup` first and keeping your other settings and hooks. The hooks do nothing in projects you have not enabled. Remove them with `optimizer-claude-hook uninstall`. Start a new Claude Code session afterwards.
+This merges hook entries into `~/.claude/settings.json`, writing `settings.json.optimizer-backup` first and keeping your other settings and hooks. A `SessionStart` entry runs `optimizer-claude-hook ensure`, which silently repairs the other entries if something removed them. Remove everything with `optimizer-claude-hook uninstall`. Start a new Claude Code session afterwards.
 
-**3. Enable a project (once per project).**
+From then on the optimizer is on in every Claude Code session, in any folder. There is no per-project setup. The first prompt in a folder creates `.optimizer/` there (or uses the nearest parent that already has one) and, inside a git repository, adds `.optimizer/` to `.git/info/exclude` so it never shows up in `git status`.
 
-```sh
-cd /path/to/your/project
-optimizer enable --project . --check 'npm test'
-```
-
-The `--check` command proves a task is done. Use your real test command, for example `npm test`, `pytest` or `go test ./...`. It runs without a shell, so `|`, `&&`, `;` and `>` are rejected; point it at a script if you need more. Running this command is your approval of that check. Add `.optimizer/` to the project's `.gitignore`.
-
-**4. Chat normally.**
+**3. Chat normally.**
 
 ```text
 claude
 > parseCount should reject garbage input instead of returning 0
 ```
 
-Claude drafts a goal contract from your words, asks any open questions, and waits for your approval before editing. Your plain-language answers are recorded as your decisions. Claude cannot finish until your check passes, but it may stop to wait for you. Questions that change no files need no contract.
+Claude drafts a goal contract from your words, asks any open questions, and waits for your approval before starting the task. Your plain-language answers are recorded as your decisions. Until a task starts, nothing is blocked. Once it starts, edits follow the contract and Claude cannot finish until your check passes, but it may stop to wait for you. Questions that change no files need no contract.
+
+**First task in a project: approve the check.** A task needs a check command that proves it is done, for example `npm test`, `pytest` or `go test ./...`. Claude proposes one with `optimizer propose-check`, and the hook shows you the exact argv with a short code. Reply `approve check 3f9a` (your code) to approve it; only your own typed prompt can approve. The check is reused by later tasks in that project. Checks run without a shell, so `|`, `&&`, `;` and `>` are rejected; point it at a script if you need more. You can also set it yourself with `optimizer enable --project . --check 'npm test'`.
 
 Useful commands:
 
 ```sh
 optimizer current --project .   # active task and next step
-optimizer disable --project .   # turn off for this project; history is kept
+optimizer disable --project .   # opt this project out; history is kept
+optimizer dashboard             # local read-only web page of all projects
+OPTIMIZER_DISABLED=1 claude     # one session with every optimizer hook off
 ```
 
 See [Claude Code hooks](#claude-code-hooks) for details and limits.
@@ -100,12 +97,12 @@ flowchart LR
     engine{{Decision engine<br/>nextAction}}
     verify[Verification<br/>registered checks]
   end
-  store[(.optimizer/<br/>runtime.sqlite<br/>prompts.jsonl<br/>project.json)]
+  store[(.optimizer/<br/>runtime.sqlite<br/>prompts.jsonl)]
+  userstore[(~/.config/optimizer-layer/<br/>approvals, hook token,<br/>opt-out, active session)]
   mcp[Optional MCP server<br/>read-only status and events]
-  checks[[Approved check commands<br/>from optimizer enable]]
+  checks[[Approved check commands<br/>user-approved proposal or optimizer enable]]
 
-  user -- plain-language request, answers --> agent
-  user -- optimizer enable --> cli
+  user -- plain-language request, answers, approve check CODE --> agent
   agent -- prompts, edits, stop --> hooks
   agent -- checkpoint commands --> skill
   hooks -- capture, current --> cli
@@ -113,6 +110,7 @@ flowchart LR
   cli --> goal & context & engine & verify
   verify -- runs without shell --> checks
   goal & context & engine & verify <--> store
+  cli <--> userstore
   mcp -. read-only .-> store
   hooks -- context, deny edit, block stop --> agent
 
@@ -156,13 +154,13 @@ flowchart TD
   class complete done
 ```
 
-The Claude Code hooks deny Edit and Write tools during `clarify`, `retrieve`, `review`, `reconsider` and `escalate`, and block the end of a turn until `complete`, except while waiting for the user on `clarify` or `escalate`.
+Once a task has started, the Claude Code hooks deny Edit and Write tools during `clarify`, `retrieve`, `review`, `reconsider` and `escalate`, and block the end of a turn until `complete`, except while waiting for the user on `clarify` or `escalate`. With no active task they block nothing.
 
 ## Current capabilities
 
 Implemented: structured goal extraction, versioned contract review and challenge, bounded lexical context retrieval, provenance-aware decision import, context sufficiency assessment, durable event replay, cooperative reconsideration, and independent registered-command verification.
 
-The shipped integrations are explicit skill/CLI checkpoints and opt-in Claude Code hooks (below). The runtime can gate its own checks. The hooks deny file-edit tools and block ending a turn according to the runtime's next action; they are tested with real hook JSON on stdin and were exercised once in a live Claude Code 2.1 session on the parseCount fixture (plain-language request, drafted contract, approval, a denied early edit, verified completion). Bash file edits are not intercepted, and Codex hooks are not implemented.
+The shipped integrations are explicit skill/CLI checkpoints, always-on Claude Code hooks, and a local read-only dashboard (below). The runtime can gate its own checks. The hooks deny file-edit tools and block ending a turn according to the runtime's next action; they are tested with real hook JSON on stdin and were exercised once in a live Claude Code 2.1 session on the parseCount fixture (plain-language request, drafted contract, approval, a denied early edit, verified completion). Bash file edits are not intercepted, and Codex hooks are not implemented.
 
 Broader natural-language interpretation through a replaceable model provider, richer code relationships, native conversation import, and repeated comparative evaluation remain future work. The current goal syntax and limits are documented below.
 
@@ -276,7 +274,7 @@ optimizer metrics --project /absolute/project --session SESSION
 
 Two reconsideration rounds are allowed; persistent failure then escalates to the human. `claim` never proves success. Verification detects stale source/check evidence and source mutations during a check. Independent verifier file hashes are pinned at registration. Helpers outside argv should be explicitly registered as artifacts. This does not defend against a malicious process with the same OS account modifying the optimizer itself.
 
-Install the adapter's [checkpoint skill](packages/adapter/skill/optimizer-checkpoint/SKILL.md) in the coding agent's skill directory using its normal local installation mechanism. Installation is explicit; the runtime does not rewrite host configuration. See [adapter documentation](packages/adapter/README.md). For Claude Code, the opt-in hooks below replace typing these checkpoints by hand.
+Install the adapter's [checkpoint skill](packages/adapter/skill/optimizer-checkpoint/SKILL.md) in the coding agent's skill directory using its normal local installation mechanism. Installation is explicit; the runtime does not rewrite host configuration. See [adapter documentation](packages/adapter/README.md). For Claude Code, the hooks below replace typing these checkpoints by hand.
 
 ## Claude Code hooks
 
@@ -288,16 +286,24 @@ optimizer-claude-hook install --settings /path/settings.json
 optimizer-claude-hook uninstall                      # removes only its own entries
 ```
 
-The installer pins the current Node.js executable and the runtime executable (`OPTIMIZER_BIN`, else `optimizer` on `PATH`) into the hook command. Hooks do nothing until a project is enabled. You run this yourself, which is your approval of the check commands:
+The installer pins the current Node.js executable and the runtime executable (`OPTIMIZER_BIN`, else `optimizer` on `PATH`) into the hook command. It adds `UserPromptSubmit`, `PreToolUse`, `Stop`, and a `SessionStart` (`startup|resume`) entry running `optimizer-claude-hook ensure`. `ensure` prints nothing and changes nothing while every entry is in place; otherwise it reinstalls them, replacing entries that point to a moved path. It never fails the session.
+
+**Always on.** Every folder is a project. The project root is the nearest ancestor of the session's working directory that already has `.optimizer/`, else the working directory itself; never the filesystem root or a path inside `.optimizer/`. Your home directory can be a project, but only when Claude runs in it, so a `~/.optimizer/` never absorbs the projects below it. On the first captured prompt the runtime creates `.optimizer/` (mode 0700, files 0600) for runtime data (`runtime.sqlite`, `prompts.jsonl`, drafts, loop-guard state), creates the project's per-user record `$XDG_CONFIG_HOME/optimizer-layer/projects/<sha256 of the root>.json` (default under `~/.config`, mode 0600) holding the hook token, approved checks, pending proposal, opt-out flag and active session, lists the project in `optimizer-layer/projects.json` for the dashboard, and, inside a git work tree, adds `.optimizer/` once to `.git/info/exclude`. Tracked `.gitignore` files are never edited. Opt out per project with `optimizer disable --project .` (history is kept; `enable` turns it back on), or for a whole session with `OPTIMIZER_DISABLED=1`.
+
+**Check approval.** A project needs approved check commands before a task can start; `start` without them fails and names `propose-check`. The agent runs `optimizer propose-check --project P --check CMD [--check CMD ...] [--timeout-ms N]`, which stores a pending proposal with a random four-hex-digit code and replaces any earlier one. While a proposal is pending, every prompt shows the agent the exact argv and the phrase `approve check CODE`. When your own prompt contains that phrase with the matching code (case-insensitive, whole words), the runtime makes those checks the project checks (replacing old ones, verifier artifacts pinned) and clears the proposal. Nothing else activates a proposal. `optimizer enable --project . --check 'npm test' [--check ...] [--timeout-ms 30000]` sets checks directly if you prefer the CLI; without `--check`, a `package.json` test script is proposed and needs `--yes`. Check commands are split into argv without a shell; the shell metacharacters ``| ; & $ > < ` `` are rejected, and the executable is resolved to an absolute path. Each project check covers every requirement of every task.
+
+**On each prompt** the hook captures your message into `.optimizer/prompts.jsonl` and injects the current state. With no open contract it says so, and that a code-change request should get a drafted contract under `.optimizer/drafts/`, shown to you, and `optimizer start --project P --request DRAFT` after you approve (`--replace` supersedes an unfinished session). Nothing is blocked until a task starts. With an active task, edit tools are denied while the action is clarify, review, retrieve, reconsider, or escalate, and Stop is blocked while the task is unverified, at most three consecutive times and never twice for unchanged state. Without an active session, `PreToolUse` and `Stop` read only the project's per-user record and do not start the runtime. A session that reaches verified `complete` releases the active-session pointer. The hooks never write runtime state through a symlink planted in `.optimizer/`.
+
+A captured prompt can answer a human question with `optimizer resolve --question Q1 --source prompt:ID`; only rows written by the hook's `prompt` capture carry that authority. Each row carries an HMAC made with the per-user hook token, and capture needs that token once the project has a per-user record (the first capture creates it). Nothing inside the project is trusted for approvals: a committed `.optimizer/project.json` is ignored, and committed `prompts.jsonl` rows fail the HMAC check. `start` re-checks stored check argv with the `enable` rules, and a check runs only if its argv matches a currently approved project check. When the project is opted out, `check` refuses to run. A folder with no per-user record (plain CLI use without hooks, sessions started with explicit `--checks`) runs the session's own registered checks, and those can come from a runtime database committed to the project, so use explicit `--checks` sessions only in project directories you trust. A same-user agent could still read the per-user record and call the runtime directly; Edit and Write into the per-user store or any `.optimizer/` path outside the root's `drafts/` are denied, and the Bash matcher denies commands that mention `optimizer` or `cli.ts` together with the words `enable`, `disable` or `prompt` (`propose-check` stays allowed), commands that mention `optimizer-layer/projects`, and commands that mention `.optimizer` outside `.optimizer/drafts/`. This is a string match and best-effort only: an agent can still get around it, for example with a variable, an alias, or a script file, and the Read tool is not intercepted. Projects with a per-user record reject `start --checks`. Hook infrastructure failures fail open with a one-line stderr diagnostic.
+
+## Dashboard
 
 ```sh
-optimizer enable --project . --check 'npm test' [--check 'node test/acceptance.mjs'] [--timeout-ms 30000]
-optimizer disable --project .                        # keeps history
+optimizer dashboard              # http://127.0.0.1:8790/?token=...
+optimizer dashboard --port 0     # any free port
 ```
 
-Check commands are split into argv without a shell; the shell metacharacters ``| ; & $ > < ` `` are rejected, and the executable is resolved to an absolute path at enable time. Without `--check`, a `package.json` test script is proposed and needs `--yes`. Each project check covers every requirement of every task.
-
-Then chat normally. On each prompt the hook captures your message into `.optimizer/prompts.jsonl` and injects the current contract state. With no open contract, Claude drafts one under `.optimizer/drafts/`, shows it, and runs `optimizer start --project P --request DRAFT` after you approve (`--replace` supersedes an unfinished session). Edit tools are denied while there is no contract or while the action is clarify, review, retrieve, reconsider, or escalate. Stop is blocked while a started task is unverified, at most three consecutive times and never twice for unchanged state. A captured prompt can answer a human question with `optimizer resolve --question Q1 --source prompt:ID`; only rows written by the hook's `prompt` capture, which needs the per-project hook token, carry that authority. A same-user agent could still read the token and call the runtime directly; the Bash matcher denies commands that mention `optimizer` or `cli.ts` together with the words `enable`, `disable` or `prompt`, and commands that mention `.optimizer` outside `.optimizer/drafts/`. This is a string match and best-effort only: an agent can still get around it, for example with a variable, an alias, or a script file, and the Read tool is not intercepted. Enabled projects reject `start --checks`; checks come only from `optimizer enable`. Hook infrastructure failures fail open with a one-line stderr diagnostic.
+Prints `{"url": ...}` and serves a read-only page until you stop it (Ctrl-C). It binds `127.0.0.1` only. Every request needs the random per-start token from the URL and a `Host` of `127.0.0.1:PORT` or `localhost:PORT`. It opens each registered project read-only and shows: enabled or opted out, approved checks, a pending proposal (argv only, never the code), the active session, and per session (newest 20) the goal version, requirements with acceptance, open questions, review state, next action, control state, check runs (outcome, duration, time), completion, and optimizer versus external time. It never shows captured prompts, resolved answers, check output, or the hook token. The page refreshes every 5 seconds, follows the system light or dark mode, and loads no external assets.
 
 ## Previous conversation decisions
 

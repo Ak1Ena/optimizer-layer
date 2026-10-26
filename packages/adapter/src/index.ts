@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { isAbsolute } from 'node:path';
 
 export type OptimizerCommand =
-  | 'init' | 'enable' | 'disable' | 'prompt' | 'current' | 'start' | 'history' | 'retrieve' | 'assess' | 'review' | 'resolve' | 'next'
+  | 'init' | 'propose-check' | 'enable' | 'disable' | 'prompt' | 'current' | 'start' | 'history' | 'retrieve' | 'assess' | 'review' | 'resolve' | 'next'
   | 'check' | 'reconsider' | 'claim' | 'verify' | 'status' | 'events' | 'metrics';
 
 export interface OptimizerInput {
