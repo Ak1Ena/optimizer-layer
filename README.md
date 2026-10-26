@@ -6,6 +6,59 @@ The working agent implements the task. Optimizer Layer maintains the goal contra
 
 The current prototype delivers a bounded goal-to-verification cycle. Improved efficiency remains a research hypothesis; the recorded demonstration does not establish a speed, token, or quality advantage.
 
+## Quick start with Claude Code
+
+Requires Node.js 24.18.x.
+
+**1. Build and install (once per machine).**
+
+```sh
+git clone https://github.com/Ak1Ena/optimizer-layer.git
+cd optimizer-layer
+nvm use
+npm ci
+npm run build
+npm pack ./dist/npm/runtime ./dist/npm/adapter ./dist/npm/mcp
+npm install -g ./optimizer-layer-runtime-0.1.0.tgz ./optimizer-layer-agent-adapter-0.1.0.tgz ./optimizer-layer-mcp-0.1.0.tgz
+```
+
+The binaries use `#!/usr/bin/env node`. If your default `node` is older than 24.18, run them through a wrapper that calls Node.js 24 explicitly, because older versions lack `node:sqlite`.
+
+**2. Install the Claude Code hooks (once per machine).**
+
+```sh
+optimizer-claude-hook install
+```
+
+This merges hook entries into `~/.claude/settings.json`, writing `settings.json.optimizer-backup` first and keeping your other settings and hooks. The hooks do nothing in projects you have not enabled. Remove them with `optimizer-claude-hook uninstall`. Start a new Claude Code session afterwards.
+
+**3. Enable a project (once per project).**
+
+```sh
+cd /path/to/your/project
+optimizer enable --project . --check 'npm test'
+```
+
+The `--check` command proves a task is done. Use your real test command, for example `npm test`, `pytest` or `go test ./...`. It runs without a shell, so `|`, `&&`, `;` and `>` are rejected; point it at a script if you need more. Running this command is your approval of that check. Add `.optimizer/` to the project's `.gitignore`.
+
+**4. Chat normally.**
+
+```text
+claude
+> parseCount should reject garbage input instead of returning 0
+```
+
+Claude drafts a goal contract from your words, asks any open questions, and waits for your approval before editing. Your plain-language answers are recorded as your decisions. Claude cannot finish until your check passes, but it may stop to wait for you. Questions that change no files need no contract.
+
+Useful commands:
+
+```sh
+optimizer current --project .   # active task and next step
+optimizer disable --project .   # turn off for this project; history is kept
+```
+
+See [Claude Code hooks](#claude-code-hooks) for details and limits.
+
 ## How it works
 
 1. **Define the goal.** Extract requirements, acceptance criteria, and unresolved questions from an explicitly selected request.
