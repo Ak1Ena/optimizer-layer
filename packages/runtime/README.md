@@ -35,7 +35,7 @@ An explicitly read-only `new Runtime(project, { readOnly: true })` opens an exis
 
 Verification checks are trusted, operator-selected argv commands. Register them separately from goal text. They run with this process's privileges and environment; this library is not an arbitrary-command sandbox. Referenced verifier files are pinned; add `artifactFiles: ["/trusted/helper.mjs"]` for helper dependencies not visible in argv. The runtime computes their digests. Changed artifacts require a new operator-registered contract. The current Node executable is trusted as part of the optimizer runtime.
 
-Single-host transactions serialize state and checks. A check holds a write transaction for its bounded duration (at most 30 seconds); other writers fail after a two-second busy wait. No automatic retry executes a command twice. Reads/replay load the session's full event history; this slice targets bounded coding tasks.
+Single-host transactions serialize state and checks. A check holds a write transaction for its bounded duration (at most 10 minutes); other writers fail after a two-second busy wait. No automatic retry executes a command twice. Reads/replay load the session's full event history; this slice targets bounded coding tasks.
 
 Measurements separate registered child-process duration from measured library operation time. Measurement persistence and process startup are not fully included; CLI wall-time measurements in the demonstration capture process overhead separately. Token counts remain unknown when the host supplies none.
 

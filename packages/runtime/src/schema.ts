@@ -22,9 +22,11 @@ const recordedReview = z.discriminatedUnion('kind', [
 const contractReview = z.union([z.object({ kind: z.literal('pending') }).strict(), recordedReview]);
 export type ReviewResponse = z.infer<typeof reviewResponse>;
 export type ContractReview = z.infer<typeof contractReview>;
+/** Real test suites take minutes; a check holds the session's write transaction for at most this long. */
+export const maxCheckTimeoutMs = 600_000;
 const checkDefinition = z.object({
   id, requirementIds: z.array(id).min(1), argv: z.tuple([text]).rest(z.string().max(100_000)),
-  timeoutMs: z.number().int().min(10).max(30_000),
+  timeoutMs: z.number().int().min(10).max(maxCheckTimeoutMs),
 }).strict();
 const checkSchema = checkDefinition.extend({
   artifacts: z.array(z.object({ path: text, digest: text }).strict()).default([]),

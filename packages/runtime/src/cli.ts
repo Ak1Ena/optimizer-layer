@@ -7,7 +7,7 @@ import { gate, Runtime } from './runtime.ts';
 import { sameSecret } from './user-store.ts';
 import { capturePrompt, disableProject, enableProject, requestProjectChange, projectView, proposeChecks, readProjectConfig, sessionSummary } from './project.ts';
 import { startDashboard } from './dashboard.ts';
-import { parseAssessment, parseReviewResponse } from './schema.ts';
+import { maxCheckTimeoutMs, parseAssessment, parseReviewResponse } from './schema.ts';
 
 const usage = `optimizer COMMAND --project PATH [--session ID]
 optimizer dashboard [--port N]   (local read-only web page; default port 8790, 0 picks a free one)
@@ -70,7 +70,7 @@ function pageNumber(value: string, name: string, maximum: number): number {
 }
 
 function timeoutMs(value: unknown): number {
-  return typeof value === 'string' ? pageNumber(value, 'timeout-ms', 30_000) : 30_000;
+  return typeof value === 'string' ? pageNumber(value, 'timeout-ms', maxCheckTimeoutMs) : 30_000;
 }
 
 function checkCommands(value: unknown): string[] {

@@ -163,6 +163,17 @@ test('checks are proposed by the agent and activated only by a hook-captured pro
   assert.deepEqual(readProjectConfig(project)?.checks.map(check => check.argv.slice(1)), [['--version']], 'approval replaces the old checks');
 });
 
+test('propose-check accepts a check timeout up to ten minutes', (t) => {
+  const { project, checker } = setup(t);
+  const propose = (ms: string) => spawnSync(process.execPath, [cli, 'propose-check', '--project', project, '--check', `node ${checker}`, '--timeout-ms', ms], { encoding: 'utf8' });
+  const accepted = propose('600000');
+  assert.equal(accepted.status, 0, accepted.stderr);
+  assert.equal(JSON.parse(accepted.stdout).checks[0].timeoutMs, 600_000);
+  const rejected = propose('600001');
+  assert.notEqual(rejected.status, 0);
+  assert.match(rejected.stderr, /Invalid timeout-ms/);
+});
+
 test('approval skips pinning large interpreter binaries and keeps the prompt when activation fails', (t) => {
   const { project, checker } = setup(t);
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'optimizer-big-')));
