@@ -22,11 +22,12 @@ export function reduceEvent(state: SessionState | null, event: Event): SessionSt
       }
       return { ...state, goal: { ...state.goal, version: state.goal.version + 1 }, review: { kind: 'pending' }, decisions: [...decisions.values()], context: null, assessment: null, evidence: [] };
     }
-    case 'context.retrieved': return { ...state, context: payload.context, assessment: null };
+    // A policy assessment cites no items, so a new snapshot leaves it valid.
+    case 'context.retrieved': return { ...state, context: payload.context, assessment: state.assessment?.kind === 'policy' ? state.assessment : null };
     case 'context.assessed': return { ...state, assessment: payload.assessment };
     case 'contract.reviewed': {
       if (payload.review.goalVersion !== state.goal.version) throw new Error('Review references a stale goal version');
-      if (payload.review.kind === 'accepted') return { ...state, review: payload.review };
+      if (payload.review.kind === 'accepted' || payload.review.kind === 'policy') return { ...state, review: payload.review };
       const review = payload.review;
       if (!state.goal.requirements.some(item => item.id === review.requirementId)) throw new Error('Challenge references unknown requirement');
       if (state.goal.uncertainties.some(item => item.id === review.uncertaintyId)) throw new Error('Duplicate review uncertainty');
@@ -54,6 +55,13 @@ export function reduceEvent(state: SessionState | null, event: Event): SessionSt
     case 'session.replaced':
     case 'decision.recorded':
     case 'decision.outcome': return state;
+    case 'tier.decided': {
+      // Light is chosen once, at start: only a fresh session (no tier, no phase yet) may take it.
+      if (payload.tier === 'light' && (state.tier !== undefined || state.phase !== undefined)) throw new Error('Only a fresh session can start on the light tier; a session never de-escalates');
+      if (payload.tier === 'light') return { ...state, tier: 'light' };
+      // Escalation drops only the policy records; the agent now assesses and reviews.
+      return { ...state, tier: 'standard', assessment: state.assessment?.kind === 'policy' ? null : state.assessment, review: state.review.kind === 'policy' ? { kind: 'pending' } : state.review };
+    }
     case 'workflow.transitioned': {
       if ((state.phase ?? null) !== payload.from) throw new Error('Workflow transition from a stale phase');
       return { ...state, phase: payload.to };
@@ -184,6 +192,12 @@ export class Store {
   sessionForPrompt(promptId: string): string | null {
     const row = this.#db.prepare("SELECT session_id FROM events WHERE json_extract(body, '$.payload.kind')='session.started' AND json_extract(body, '$.payload.state.origin.promptId')=? ORDER BY sequence DESC LIMIT 1").get(promptId);
     return row ? String(row.session_id) : null;
+  }
+
+  /** Duration of the most recent passing run of this argv in any session of the project; failures (often instant) say nothing about cost. */
+  lastCheckDurationMs(argv: readonly string[]): number | null {
+    const row = this.#db.prepare("SELECT json_extract(body, '$.payload.evidence.result.durationMs') AS ms FROM events WHERE json_extract(body, '$.payload.kind')='command.observed' AND json_extract(body, '$.payload.evidence.result.outcome')='passed' AND json_extract(body, '$.payload.evidence.result.argv')=json(?) ORDER BY sequence DESC LIMIT 1").get(JSON.stringify(argv));
+    return typeof row?.ms === 'number' ? row.ms : null;
   }
 
   /** Session IDs, most recently started first. */

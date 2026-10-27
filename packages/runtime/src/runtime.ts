@@ -3,15 +3,15 @@ import { existsSync } from 'node:fs';
 import { isAbsolute, join, resolve } from 'node:path';
 import { Store } from './store.ts';
 import { availableActions, chooseAction, ruleModel, shadowModel, stateFeatures } from './decision-model.ts';
-import { classifyTool, decide, evaluate, managedProject, phaseFor, projectChecksAcceptance, reservedAction, verificationOutcome, type Decision, type GateAction } from './controller.ts';
+import { classifyTool, decide, evaluate, inexpensiveCheckMs, lightTierBlocker, lightTierRule, managedProject, phaseFor, projectChecksAcceptance, reservedAction, verificationOutcome, type Decision, type GateAction } from './controller.ts';
 import { extractGoal, assessGate, nextAction, verifiedRequirementIds } from './intelligence.ts';
 import { capturedPrompts, importConversation, isContextCurrent, projectDigest, retrieveContext, sourceDecisions } from './context.ts';
 import { assertSafeArgv, readProjectConfig, writeProjectConfig } from './project.ts';
 import { canonicalRoot } from './user-store.ts';
-import { nonempty, parseAssessment, parseChecks, parseReviewResponse } from './schema.ts';
+import { nonempty, parseAssessment, parseChecks, parseReviewResponse, type AgentAssessment } from './schema.ts';
 import { runCommand } from './process.ts';
 import { artifactsCurrent, registerArtifacts } from './verification.ts';
-import type { ContextAssessment, Control, Decision as UserDecision, Goal, Measurement, NextAction, Phase, ReviewResponse, SessionState, VerificationEvidence } from './types.ts';
+import type { Control, Decision as UserDecision, Goal, Measurement, NextAction, Phase, ReviewResponse, SessionState, Tier, VerificationEvidence } from './types.ts';
 import type { ProjectConfig } from './schema.ts';
 
 export class Runtime {
@@ -82,7 +82,7 @@ export class Runtime {
       evidence: state.evidence.filter(item => validChecks.has(item.checkId)),
       goal: { ...state.goal, uncertainties },
       context: contextCurrent ? state.context : null,
-      assessment: contextCurrent ? state.assessment : null,
+      assessment: contextCurrent || state.assessment?.kind === 'policy' ? state.assessment : null,
     };
   }
 
@@ -165,6 +165,7 @@ export class Runtime {
   #sync(sessionId: string, cause: string): void {
     if (this.#readOnly) return;
     this.#measure(sessionId, 'phase', () => {
+      this.#escalate(sessionId);
       const stored = this.#store.get(sessionId);
       const state = this.#current(stored);
       const next = this.#action(state);
@@ -174,7 +175,35 @@ export class Runtime {
     });
   }
 
-  /** Without explicit checks, the project's user-approved checks cover every requirement of the new goal. */
+  /** A light session escalates to standard, recorded with its trigger, as soon as it stops qualifying; it never de-escalates. */
+  #escalate(sessionId: string): void {
+    const state = this.#current(this.#store.get(sessionId));
+    if (state.tier !== 'light' || state.phase === 'verified') return;
+    const policy = state.assessment?.kind === 'policy' && state.review.kind === 'policy' && state.review.goalVersion === state.goal.version;
+    const trigger = lightTierBlocker(state) ?? (policy ? null : 'policy assessment or review replaced (agent assessment, review, or a new goal version)');
+    if (trigger) this.#store.update(sessionId, () => ({ kind: 'tier.decided', tier: 'standard', trigger }));
+  }
+
+  /** Light-tier eligibility at start: the shared blocker plus approval, cost and history facts only the runtime knows. */
+  #startTier(state: SessionState, approved: boolean, priorSession: string | null): string | null {
+    if (!approved) return 'checks are not the user-approved project checks';
+    const blocker = lightTierBlocker(state);
+    if (blocker) return blocker;
+    for (const check of state.checks) {
+      // shortcut: before any recorded run the timeout bounds the cost; a recorded duration replaces it.
+      const duration = this.#store.lastCheckDurationMs(check.argv);
+      if (duration === null ? check.timeoutMs > inexpensiveCheckMs : duration >= inexpensiveCheckMs) {
+        return duration === null
+          ? `check ${check.id} has no recorded run and its timeout ${check.timeoutMs / 1000} s exceeds the ${inexpensiveCheckMs / 1000} s light-tier threshold`
+          : `check ${check.id} last ran ${Math.round(duration / 1000)} s, over the ${inexpensiveCheckMs / 1000} s light-tier threshold`;
+      }
+    }
+    if (priorSession && this.#store.events(priorSession).some(({ event }) => event.payload.kind === 'tier.decided' && event.payload.tier === 'standard')) {
+      return `prior session ${priorSession} for this prompt escalated`;
+    }
+    return null;
+  }
+
   /**
    * Without explicit checks, the project's user-approved checks cover every requirement of the new goal.
    * `agent` marks the agent-reachable CLI path: in a managed project its goal must keep the latest captured prompt verbatim.
@@ -246,6 +275,7 @@ export class Runtime {
       latestPrompt = capturedPrompts(this.projectRoot).findLast(item => !/^approve\s+check\s+[0-9a-f]{4}$/i.test(item.text))?.text ?? null;
     }
     for (const check of enabled?.checks ?? []) assertSafeArgv(check.argv);
+    const priorSession = prompt ? this.#store.sessionForPrompt(prompt.id) : null;
     const started = this.#measure(id, 'start', () => {
       const goal: Goal = prompt
         ? { version: 1, request: prompt.text, requirements: [{ id: 'R1', statement: prompt.text, acceptance: projectChecksAcceptance, acceptanceSource: 'project-checks', sourceLine: 1 }], uncertainties: [] }
@@ -271,7 +301,12 @@ export class Runtime {
         failureStreak: { signature: '', count: 0 }, completionClaimed: false,
       };
       this.#store.append({ version: 1, id: randomUUID(), sessionId: id, producer: 'runtime', at: new Date().toISOString(), payload: { kind: 'session.started', state } });
-      return state;
+      const trigger = this.#startTier(state, input.checks === undefined && enabled !== null, priorSession);
+      this.#store.update(id, () => ({ kind: 'tier.decided', tier: trigger ? 'standard' : 'light', trigger: trigger ?? lightTierRule }));
+      if (trigger) return this.#store.get(id);
+      // Recorded, never asked of the agent: both stay visible in history with the rule that justified them.
+      this.#store.update(id, () => ({ kind: 'context.assessed', assessment: { kind: 'policy', rule: lightTierRule } }));
+      return this.#store.update(id, current => ({ kind: 'contract.reviewed', review: { kind: 'policy', goalVersion: current.goal.version, rule: lightTierRule } }));
     });
     if (replaced) {
       try {
@@ -324,7 +359,7 @@ export class Runtime {
     return context;
   }
 
-  assess(sessionId: string, input: ContextAssessment): SessionState {
+  assess(sessionId: string, input: AgentAssessment): SessionState {
     this.#open(sessionId);
     const assessment = parseAssessment(input);
     const state = this.#measure(sessionId, 'assess', () => this.#store.update(sessionId, stored => {
@@ -401,6 +436,11 @@ export class Runtime {
   }
 
   runCheck(sessionId: string, checkId: string): VerificationEvidence {
+    const session = this.#store.get(sessionId);
+    if (!session.checks.some(item => item.id === checkId)) throw new Error('Unknown registered check');
+    if (session.control.kind !== 'running') throw new Error(`Execution is ${session.control.kind}; resolve cooperative control first`);
+    // Light tier: the runtime refreshes stale context itself, so evidence binds to the current source without an agent turn.
+    if (session.tier === 'light' && session.phase !== 'verified' && !(session.context && isContextCurrent(this.projectRoot, session.context))) this.retrieve(sessionId);
     const observed = this.#measure(sessionId, 'check', timing => this.#store.commit(sessionId, stored => {
       if (stored.phase === 'verified') throw new Error('Session is verified and closed; new work starts a new session');
       const state = this.#current(stored);
@@ -428,8 +468,13 @@ export class Runtime {
         ? { signature: '', count: 0 }
         : { signature, count: stored.failureStreak.signature === signature ? stored.failureStreak.count + 1 : 1 };
       let control: Control = state.control;
-      if (failureStreak.count >= 3) {
-        const reason = `Check ${check.id} failed three consecutive times. Pause, inspect the evidence, and provide a justified reconsideration response.`;
+      // Intentional: on Light no agent reviewed the approach, so a second identical failure (or any failure after a claim)
+      // is the earliest evidence it is wrong; the pause escalates the session to standard. Standard pauses on the third.
+      const lightReplan = state.tier === 'light' && result.outcome !== 'passed' && (failureStreak.count >= 2 || stored.completionClaimed);
+      if (failureStreak.count >= 3 || lightReplan) {
+        const reason = failureStreak.count >= 2
+          ? `Check ${check.id} failed ${failureStreak.count === 2 ? 'twice' : 'three times'} in a row. Pause, inspect the evidence, and provide a justified reconsideration response.`
+          : `Check ${check.id} failed after a completion claim. Pause, inspect the evidence, and provide a justified reconsideration response.`;
         control = state.control.rounds < 2
           ? { kind: 'paused', rounds: state.control.rounds + 1, reason }
           : { kind: 'escalated', rounds: state.control.rounds, reason: 'Reconsideration budget exhausted; a human decision is required.' };
@@ -461,16 +506,16 @@ export class Runtime {
   }
 
   /** The authoritative structured decision for a session. */
-  decide(sessionId: string): Decision & { sessionId: string; action: NextAction } {
+  decide(sessionId: string): Decision & { sessionId: string; action: NextAction; tier: Tier } {
     return this.#measure(sessionId, 'decide', () => {
       const state = this.#current(this.#store.get(sessionId));
       const action = this.#action(state);
-      return { sessionId, ...decide(state, action), action };
+      return { sessionId, ...decide(state, action), action, tier: state.tier ?? 'standard' };
     });
   }
 
   /** Decision 6: an exhausted Stop budget is recorded as blocked, never as a stop with the task complete. */
-  block(sessionId: string, cause: string): Decision & { sessionId: string; action: NextAction } {
+  block(sessionId: string, cause: string): Decision & { sessionId: string; action: NextAction; tier: Tier } {
     const reason = nonempty(cause, 'reason');
     this.#measure(sessionId, 'block', () => {
       const phase = this.#store.get(sessionId).phase;
@@ -511,7 +556,7 @@ export class Runtime {
       const executing = verdict.allow && checkpoint.phase === 'ready' && state.phase !== 'executing';
       if (executing) this.#transition(id, 'executing', `tool:${action.tool}`);
       this.#record(id, executing ? { ...state, phase: 'executing' } : state, next);
-      return { ...verdict, sessionId: id, started, checkpoint };
+      return { ...verdict, sessionId: id, started, checkpoint: { ...checkpoint, tier: state.tier ?? 'standard' } };
     });
   }
 

@@ -1,5 +1,6 @@
 import { classifyBash, reservedPath, type BashContext } from './bash.ts';
 import { nextAction } from './intelligence.ts';
+export { inexpensiveCheckMs, lightTierBlocker } from './intelligence.ts';
 import type { ProjectConfig } from './schema.ts';
 import type { NextAction, Phase, SessionState } from './types.ts';
 
@@ -16,6 +17,7 @@ export interface GateVerdict { allow: boolean; decision: DecisionKind; reason: s
 
 export const projectChecksAcceptance = 'Every user-approved project check passes against the final source.';
 
+export const lightTierRule = 'Light tier: the user-approved project checks define acceptance, no question is open and the checks are inexpensive, so context sufficiency and contract review are satisfied by policy.';
 /** Managed = tracked by the installed hook mode and verifiable by at least one user-approved check. */
 export function managedProject(config: ProjectConfig | null, mode: string | undefined): boolean {
   const optIn = mode !== undefined && mode !== 'always-on' && mode !== 'managed';

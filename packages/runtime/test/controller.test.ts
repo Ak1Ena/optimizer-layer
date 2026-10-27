@@ -23,6 +23,7 @@ test.after(() => rmSync(home, { recursive: true, force: true }));
 const request = 'Make parseCount throw RangeError for negative values and keep returning numbers otherwise.';
 const fixed = 'export function parseCount(value) { const count = Number(value); if (count < 0) throw new RangeError("negative"); return count; }\n';
 
+// A check timeout over the 60 s light-tier bound keeps these fixtures on the standard tier, whose behaviour they pin.
 function setup(t: test.TestContext) {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'optimizer-controller-')));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -36,7 +37,7 @@ const { parseCount } = await import(pathToFileURL(process.argv[2] + '/counter.mj
 assert.equal(parseCount('2'), 2);
 assert.throws(() => parseCount('-1'), RangeError);
 `);
-  enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 5000, yes: false });
+  enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 120_000, yes: false });
   const token = readProjectConfig(project)?.hookToken ?? '';
   const promptId = `prompt:${capturePrompt(project, request, token).id}`;
   const runtime = new Runtime(project);

@@ -12,7 +12,7 @@ export interface StateFeatures {
   openLocalQuestions: number;
   contextComplete: boolean | null;
   uncoveredRequirements: number;
-  reviewState: 'pending' | 'accepted' | 'challenged';
+  reviewState: 'pending' | 'accepted' | 'challenged' | 'policy';
   control: 'running' | 'paused' | 'escalated';
   failureStreak: number;
   reconsiderationRounds: number;

@@ -62,7 +62,11 @@ export interface ContextSnapshot {
 }
 export type ContextAssessment =
   | { kind: 'sufficient'; rationale: string; itemIds: string[] }
-  | { kind: 'insufficient'; rationale: string; itemIds: string[] };
+  | { kind: 'insufficient'; rationale: string; itemIds: string[] }
+  /** Light tier: sufficiency satisfied by a recorded policy rule instead of an agent turn. */
+  | { kind: 'policy'; rule: string };
+/** Light: approved checks define acceptance, so assessment and review are policy records. Standard: agent assess + review. */
+export type Tier = 'light' | 'standard';
 export type Gate =
   | { kind: 'review'; reason: string }
   | { kind: 'proceed'; reason: string }
@@ -94,6 +98,8 @@ export interface SessionState {
   id: string;
   /** Last recorded workflow phase; absent in sessions persisted before phases existed. */
   phase?: Phase | undefined;
+  /** Absent in sessions persisted before tiers existed; they behave as standard. Only ever escalates. */
+  tier?: Tier | undefined;
   /** Controller-started sessions record the hook-captured prompt they came from. */
   origin?: { promptId: string } | undefined;
   goal: Goal;
@@ -129,6 +135,7 @@ export type EventPayload =
   | { kind: 'completion.claimed' }
   | { kind: 'session.replaced'; replacedBy: string }
   | { kind: 'workflow.transitioned'; from: Phase | null; to: Phase; cause: string }
+  | { kind: 'tier.decided'; tier: Tier; trigger: string }
   | {
     kind: 'decision.recorded'; decisionId: string; features: StateFeatures; availableActions: DecisionAction[]; chosenAction: DecisionKind;
     decisionModelVersion: string; shadow?: { version: string; ranking: RankedAction[] } | undefined;

@@ -32,7 +32,8 @@ import { pathToFileURL } from 'node:url';
 const { parseCount } = await import(pathToFileURL(process.argv[2] + '/counter.mjs'));
 assert.throws(() => parseCount('-1'), RangeError);
 `);
-  enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 5000, yes: false });
+  // Over the light-tier bound: these cases exercise the standard tier's mandatory checkpoints.
+  enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 120_000, yes: false });
   capturePrompt(project, request, readProjectConfig(project)?.hookToken);
   const runtime = new Runtime(project);
   t.after(() => runtime.close());

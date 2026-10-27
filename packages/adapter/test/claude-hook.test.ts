@@ -104,13 +104,15 @@ test('opt-in mode leaves a folder the user has not enabled untouched, then runs 
   untouched();
 
   enableProject(project, { commands: [], timeoutMs: 30_000, yes: false });
-  const context = (cwd = project) => String(field(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'hi' }, cwd, optIn).output, 'hookSpecificOutput', 'additionalContext'));
-  assert.match(context(), /prompt:[0-9a-f-]{36}[\s\S]*no approved check commands yet/);
+  const prompt = (cwd = project) => hook({ hook_event_name: 'UserPromptSubmit', prompt: 'hi' }, cwd, optIn).output;
+  assert.equal(prompt(), undefined, 'an idle project injects nothing');
   mkdirSync(join(project, 'src'));
-  assert.match(context(join(project, 'src')), new RegExp(`Project ${project} has`), 'a subfolder session uses the enabled root');
+  assert.equal(prompt(join(project, 'src')), undefined);
+  assert.equal(readFileSync(join(project, '.optimizer', 'prompts.jsonl'), 'utf8').trim().split('\n').length, 2, 'a subfolder session captures into the enabled root');
+  assert.equal(existsSync(join(project, 'src', '.optimizer')), false);
   const code = String(field(optimizer('propose-check', '--check', `node ${checker}`), 'code'));
   const approved = String(field(hook({ hook_event_name: 'UserPromptSubmit', prompt: `approve check ${code}` }, project, optIn).output, 'hookSpecificOutput', 'additionalContext'));
-  assert.match(approved, /user approved the proposed check commands[\s\S]*Approved project checks:/);
+  assert.match(approved, /user approved the proposed check commands/);
   // An agent-started contract in a managed project keeps the latest captured prompt ('hi') verbatim.
   writeFileSync(join(project, 'goal.md'), '- R1: hi\nAcceptance R1: greeting returns hello.\n');
   optimizer('start', '--request', join(project, 'goal.md'));
@@ -194,9 +196,7 @@ test('a committed .optimizer/project.json neither disables the hooks nor supplie
     projectRoot: project, enabled: false, hookToken: 'a'.repeat(64), activeSessionId: null, pendingChecks: null,
     checks: [{ id: 'check-1', requirementIds: ['*'], argv: ['/bin/sh', '-c', 'echo pwned'], timeoutMs: 1000, artifacts: [] }],
   }));
-  const context = String(field(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'hi' }).output, 'hookSpecificOutput', 'additionalContext'));
-  assert.match(context, /no approved check commands yet/);
-  assert.doesNotMatch(context, /pwned/);
+  assert.equal(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'hi' }).output, undefined, 'the planted record supplies no checks, so nothing is injected');
   const store = join(home, 'config', 'optimizer-layer', 'projects', 'x.json');
   assert.equal(field(hook(edit(store)).output, 'hookSpecificOutput', 'permissionDecision'), 'deny');
   assert.equal(field(hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: `cat ${store}` } }).output, 'hookSpecificOutput', 'permissionDecision'), 'deny');
@@ -206,26 +206,29 @@ test('any folder is a project: the nearest .optimizer ancestor, else cwd, never 
   const { project, hook } = setup(t);
   const deep = join(project, 'src', 'deep');
   mkdirSync(deep, { recursive: true });
-  const context = (cwd: string) => String(field(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'hi' }, cwd).output, 'hookSpecificOutput', 'additionalContext'));
-  assert.match(context(deep), new RegExp(`Project ${deep} has no open optimizer goal contract`));
-  assert.match(context(join(project, 'src')), new RegExp(`Project ${join(project, 'src')} has`), 'a parent without .optimizer/ is not an ancestor match');
-  assert.match(context(join(deep, 'x', '..')), new RegExp(`Project ${deep} has`));
+  // Idle prompts inject nothing, so the root shows in where the prompt was captured.
+  const rows = (root: string) => existsSync(join(root, '.optimizer', 'prompts.jsonl')) ? readFileSync(join(root, '.optimizer', 'prompts.jsonl'), 'utf8').trim().split('\n').length : 0;
+  const prompt = (cwd: string) => assert.equal(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'hi' }, cwd).output, undefined);
+  prompt(deep);
+  assert.equal(rows(deep), 1);
+  prompt(join(project, 'src'));
+  assert.deepEqual([rows(join(project, 'src')), rows(deep)], [1, 1], 'a parent without .optimizer/ is not an ancestor match');
+  prompt(join(deep, 'x', '..'));
+  assert.equal(rows(deep), 2);
   mkdirSync(join(deep, '.optimizer', 'drafts'), { recursive: true });
-  assert.match(context(join(deep, '.optimizer', 'drafts')), new RegExp(`Project ${deep} has`), 'never a path inside .optimizer/');
+  prompt(join(deep, '.optimizer', 'drafts'));
+  assert.equal(rows(deep), 3, 'never a path inside .optimizer/');
   mkdirSync(join(deep, 'child'));
-  assert.match(context(join(deep, 'child')), new RegExp(`Project ${deep} has`));
+  prompt(join(deep, 'child'));
+  assert.equal(rows(deep), 4);
+  assert.equal(existsSync(join(deep, 'child', '.optimizer')), false);
   assert.deepEqual(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'hi' }, '/'), { output: undefined, stderr: '' });
 });
 
 test('hooks capture prompts, approve checks by code, gate edits by contract action and guard Stop without looping', t => {
   const { project, checker, optimizer, hook } = setup(t);
   const first = hook({ hook_event_name: 'UserPromptSubmit', prompt: 'greeting should greet by name' }).output;
-  const context = field(first, 'hookSpecificOutput', 'additionalContext');
-  assert.equal(field(first, 'hookSpecificOutput', 'hookEventName'), 'UserPromptSubmit');
-  assert.ok(typeof context === 'string');
-  const promptId = /prompt:([0-9a-f-]{36})/.exec(context)?.[1];
-  assert.ok(promptId);
-  assert.match(context, /no open optimizer goal contract and is unmanaged: it has no approved check, so file edits are not gated[\s\S]*\.optimizer\/drafts\/NAME\.md[\s\S]*no approved check commands yet[\s\S]*optimizer propose-check --project [\s\S]*Acceptance R1:/);
+  assert.equal(first, undefined, 'no session, proposal or checkpoint: the prompt is captured silently');
   assert.match(readFileSync(join(project, '.optimizer', 'prompts.jsonl'), 'utf8'), /"content":"greeting should greet by name".*"capturedBy":"hook"/);
   assert.equal(hook(edit(join(project, 'greeting.mjs'))).output, undefined, 'no task started, so edits go through');
   assert.deepEqual(hook(edit('.optimizer/prompts.jsonl')).output, deny('optimizer: runtime state is written only by the optimizer runtime and hook.'));
@@ -256,9 +259,8 @@ test('hooks capture prompts, approve checks by code, gate edits by contract acti
   assert.ok(pending.includes(`Pending check proposal (argv, run without a shell):\n  ${JSON.stringify(field(argv[0], 'argv'))}\nThe user approves it by replying with \`approve check ${code}\``), pending);
   assert.doesNotMatch(pending, /approved the proposed check/);
   const approved = String(field(hook({ hook_event_name: 'UserPromptSubmit', prompt: `approve check ${code}` }).output, 'hookSpecificOutput', 'additionalContext'));
-  assert.match(approved, /user approved the proposed check commands[\s\S]*Approved project checks:/);
+  assert.match(approved, /user approved the proposed check commands/);
   assert.doesNotMatch(approved, /Pending check proposal/);
-  assert.match(approved, /is managed by the optimizer and has no open goal contract/);
   assert.equal(hook(edit(join(project, '.optimizer', 'drafts', 'goal.md'))).output, undefined, 'drafts never start a contract');
   assert.equal(hook(edit('/somewhere/else.txt')).output, undefined, 'edits outside the project are not gated');
   assert.equal(hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'ls' } }).output, undefined);
@@ -317,8 +319,9 @@ test('hooks capture prompts, approve checks by code, gate edits by contract acti
   const unspawnable = { OPTIMIZER_BIN: '/optimizer-does-not-exist' };
   const released = hook(edit(join(project, 'greeting.mjs')), project, unspawnable);
   assert.equal(field(released.output, 'hookSpecificOutput', 'permissionDecision'), 'deny', 'a managed project fails closed even after its pointer is released');
-  assert.match(String(field(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'next task' }).output, 'hookSpecificOutput', 'additionalContext')), /no open goal contract/);
-  assert.match(String(field(hook(edit(join(project, 'greeting.mjs'))).output, 'hookSpecificOutput', 'permissionDecisionReason')), /started goal contract session-[\s\S]*from the latest user prompt/, 'the next task gets its own contract');
+  assert.equal(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'next task' }).output, undefined, 'idle again: nothing injected');
+  assert.equal(hook(edit(join(project, 'greeting.mjs'))).output, undefined, 'the next task gets its own light-tier contract, so the edit is allowed at once');
+  assert.match(String(field(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'and?' }).output, 'hookSpecificOutput', 'additionalContext')), /^optimizer: light-tier session session-\S+ is open\. Edit with normal tools, then run `optimizer verify`/);
 });
 
 test('a Stop budget that cannot be recorded as blocked blocks once more with the reason, then stops unverified', t => {
@@ -417,10 +420,10 @@ test('runtime unavailable inside a managed task denies protected actions and pas
 
 test('an agent that never calls the optimizer is held to an auto-started contract; read-only work is never blocked (§10 cases 2, 9, 10)', t => {
   const { project, checker, optimizer, hook } = setup(t);
-  enableProject(project, { commands: [`node ${checker}`], timeoutMs: 30_000, yes: false });
+  // A check timeout over the 60 s light-tier bound keeps this contract on the standard tier.
+  enableProject(project, { commands: [`node ${checker}`], timeoutMs: 120_000, yes: false });
   const record = () => JSON.parse(readFileSync(join(home, 'config', 'optimizer-layer', 'projects', `${createHash('sha256').update(project).digest('hex')}.json`), 'utf8')) as Record<string, unknown>;
-  const prompt = String(field(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'make greeting greet by name' }).output, 'hookSpecificOutput', 'additionalContext'));
-  assert.match(prompt, /is managed by the optimizer[\s\S]*starts a contract from this prompt automatically/);
+  assert.equal(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'make greeting greet by name' }).output, undefined, 'an idle managed project injects nothing');
 
   // Case 10: reads and read-only commands start nothing and are never denied.
   const bash = (command: string) => hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command } }).output;
@@ -456,6 +459,34 @@ test('an agent that never calls the optimizer is held to an auto-started contrac
   assert.match(String(field(hook({ hook_event_name: 'Stop', stop_hook_active: false }).output, 'systemMessage')), /BLOCKED and unverified/, 'a recorded block does not loop');
   assert.match(String(field(hook(edit(join(project, 'greeting.mjs'))).output, 'hookSpecificOutput', 'permissionDecisionReason')), /BLOCK_ACTION/);
   assert.match(String(field(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'status?' }).output, 'hookSpecificOutput', 'additionalContext')), new RegExp(`Active optimizer session ${sessionId}, phase blocked[\\s\\S]*Decision BLOCK_ACTION`));
+});
+
+test('light tier: idle prompts inject nothing, the first edit is allowed, and the agent is asked only to verify', t => {
+  const { project, checker, optimizer, hook } = setup(t);
+  enableProject(project, { commands: [`node ${checker}`], timeoutMs: 30_000, yes: false });
+  // The goal dialect appears only when the agent must draft a contract itself.
+  const noPrompt = String(field(hook(edit(join(project, 'greeting.mjs'))).output, 'hookSpecificOutput', 'permissionDecisionReason'));
+  assert.match(noPrompt, /without a captured user prompt[\s\S]*\.optimizer\/drafts\/NAME\.md[\s\S]*Goal dialect/);
+  assert.deepEqual(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'make greeting say hi' }), { output: undefined, stderr: '' });
+  assert.equal(hook(edit(join(project, 'greeting.mjs'))).output, undefined, 'zero optimizer steps before the first edit');
+  const sessionId = String(field(optimizer('current'), 'sessionId'));
+  const context = String(field(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'go on' }).output, 'hookSpecificOutput', 'additionalContext'));
+  assert.equal(context, `optimizer: light-tier session ${sessionId} is open. Edit with normal tools, then run \`optimizer verify\` (or \`optimizer check --check CHECK_ID\`); only outcome VERIFIED completes the task. Commands take --project ${project} --session ${sessionId}.`);
+  writeFileSync(join(project, 'greeting.mjs'), 'export const greeting = () => "hi";\n');
+  const stop = String(field(hook({ hook_event_name: 'Stop', stop_hook_active: false }).output, 'reason'));
+  assert.match(stop, /Decision PROCEED: [\s\S]*Edit with normal tools, then run `optimizer verify`/);
+  assert.doesNotMatch(stop, /optimizer (retrieve|assess|review)/);
+  assert.equal(field(optimizer('verify', '--session', sessionId), 'outcome'), 'VERIFIED', 'stale context after the edit does not block light verification');
+  assert.equal(hook({ hook_event_name: 'Stop', stop_hook_active: true }).output, undefined);
+  assert.deepEqual(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'thanks' }), { output: undefined, stderr: '' }, 'verified: idle again');
+});
+
+test('an idle prompt is silent, but a pending check proposal is still shown', t => {
+  const { checker, optimizer, hook } = setup(t);
+  assert.equal(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'hi' }).output, undefined);
+  const code = String(field(optimizer('propose-check', '--check', `node ${checker}`), 'code'));
+  const context = String(field(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'hi again' }).output, 'hookSpecificOutput', 'additionalContext'));
+  assert.match(context, new RegExp(`^Pending check proposal[\\s\\S]*approve check ${code}`));
 });
 
 test('installer merges idempotently, keeps unrelated settings and uninstalls only its entries', t => {

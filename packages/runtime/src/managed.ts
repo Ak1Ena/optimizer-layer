@@ -62,7 +62,13 @@ export function managedSettings(hook: string, runtimeBin: string) {
   } };
 }
 
-function protocol(root: string, sessionId: string, summary: string, decision: string): string {
+function protocol(root: string, sessionId: string, summary: string, decision: string, light: boolean): string {
+  if (light) {
+    return [
+      `You are running under the optimizer's Managed Execution Mode. The optimizer started light-tier goal contract ${sessionId} for project ${root} from the user's request; the user-approved checks define done.`,
+      `Edit with normal tools, then run \`optimizer verify --project ${root} --session ${sessionId}\` (or \`optimizer check --check CHECK_ID\`); only outcome VERIFIED counts as done. Never try to change the optimizer, its hooks or its state.`,
+    ].join('\n');
+  }
   return [
     `You are running under the optimizer's Managed Execution Mode. The optimizer already started goal contract ${sessionId} for project ${root} from the user's request and retrieved project context.`,
     summary,
@@ -128,7 +134,7 @@ export function managedRun(input: ManagedRunInput) {
     writeFileSync(settings, JSON.stringify(managedSettings(input.hook, input.runtimeBin), null, 2) + '\n', { mode: 0o600 });
     const agentStarted = performance.now();
     const agent = spawnSync(input.claude, [
-      '-p', '--settings', settings, '--append-system-prompt', protocol(root, session.id, summary, `${checkpoint.decision}: ${checkpoint.reason}`),
+      '-p', '--settings', settings, '--append-system-prompt', protocol(root, session.id, summary, `${checkpoint.decision}: ${checkpoint.reason}`, checkpoint.tier === 'light' && checkpoint.decision === 'PROCEED'),
       '--max-turns', String(input.maxTurns), '--output-format', 'json', ...(input.claudeArgs ?? []),
     ], { cwd: root, input: input.prompt, encoding: 'utf8', shell: false, timeout: input.timeoutMs, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024, env: { ...process.env, OPTIMIZER_MODE: 'managed', OPTIMIZER_MANAGED_RUN: '1' } });
     const agentMs = performance.now() - agentStarted;

@@ -67,6 +67,26 @@ function unresolved(uncertainty: Uncertainty): boolean {
   return !uncertainty.resolution.answer.trim() || !uncertainty.resolution.source.trim();
 }
 
+/** Spec default for an "inexpensive" check (open question Q5). */
+export const inexpensiveCheckMs = 60_000;
+
+/** Why the session cannot (or can no longer) stay on the light tier; null while it qualifies. Pure, so start and escalation share it. */
+export function lightTierBlocker(state: SessionState): string | null {
+  const open = state.goal.uncertainties.filter(question => question.resolution.kind === 'open');
+  const human = open.find(question => question.owner === 'human' && question.critical);
+  if (human) return `open critical human question ${human.id}`;
+  const local = open.find(question => question.owner === 'local');
+  if (local) return `open local question ${local.id}`;
+  const prose = state.goal.requirements.find(requirement => requirement.acceptanceSource !== 'project-checks');
+  if (prose) return `${prose.id} has prose acceptance, not the approved project checks`;
+  const uncovered = state.goal.requirements.find(requirement => !state.checks.some(check => check.requirementIds.includes(requirement.id)));
+  if (uncovered) return `${uncovered.id} is not covered by an approved check`;
+  if (state.control.kind !== 'running') return `reconsideration: ${state.control.reason}`;
+  const slow = state.evidence.find(evidence => evidence.result.durationMs >= inexpensiveCheckMs);
+  if (slow) return `check ${slow.checkId} ran ${Math.round(slow.result.durationMs / 1000)} s, over the ${inexpensiveCheckMs / 1000} s light-tier threshold`;
+  return null;
+}
+
 export function assessGate(state: SessionState): Gate {
   const humanQuestions = state.goal.uncertainties.filter(question => {
     return question.critical && question.owner === 'human' && unresolved(question);
@@ -83,6 +103,11 @@ export function assessGate(state: SessionState): Gate {
   });
   if (localQuestions) return { kind: 'investigate', reason: 'Local questions remain unresolved' };
   const { context, assessment } = state;
+  // Light tier: acceptance comes from the approved checks, not cited context, so stale or missing context does not block.
+  // The rule is re-tested here, so a session that should escalate never proceeds or closes before #sync records it.
+  if (state.tier === 'light' && lightTierBlocker(state) === null && assessment?.kind === 'policy' && state.review.kind === 'policy' && state.review.goalVersion === state.goal.version) {
+    return { kind: 'proceed', reason: state.review.rule };
+  }
   if (!context) return { kind: 'investigate', reason: 'Retrieve project context first' };
   if (!context.complete || !context.projectDigest.trim()) {
     return { kind: 'investigate', reason: 'Context retrieval is incomplete' };

@@ -10,7 +10,7 @@ import { deniedBash } from './bash-guard.ts';
 
 type Output = Record<string, unknown> | undefined;
 interface Current { sessionId: string | null; checkpoint: Decision | null; summary: string; checks: string[][]; pending: { code: string; argv: string[][] } | null }
-interface Decision { decision: string; reason: string; phase: string; requiredBy: string; uncertaintyIds: unknown }
+interface Decision { decision: string; reason: string; phase: string; requiredBy: string; uncertaintyIds: unknown; tier: string }
 
 const script = fileURLToPath(import.meta.url);
 // Only these tools reach the hook, so reads cost no runtime spawn; other tools (MCP, web) are not gated.
@@ -37,6 +37,13 @@ const instructions: Record<string, string> = {
   BLOCK_ACTION: 'Report the blocker to the user, or resume through an optimizer checkpoint command.',
   COMPLETE: 'Report the verified requirement IDs and evidence.',
 };
+/** A light-tier session needs nothing from the agent but the edit and a verification run. */
+const lightInstruction = 'Edit with normal tools, then run `optimizer verify` (or `optimizer check --check CHECK_ID`); only outcome VERIFIED completes the task.';
+
+function instruction(checkpoint: Decision): string {
+  const light = checkpoint.tier === 'light' && (checkpoint.decision === 'PROCEED' || checkpoint.decision === 'RUN_VERIFICATION');
+  return light ? lightInstruction : instructions[checkpoint.decision] ?? 'Follow the runtime reason.';
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -139,7 +146,7 @@ function decision(value: Record<string, unknown>): Decision | null {
   const kind = text(value.decision);
   if (!kind) return null;
   const action = isRecord(value.action) ? value.action : {};
-  return { decision: kind, reason: text(value.reason) ?? '', phase: text(value.phase) ?? 'unknown', requiredBy: text(value.requiredBy) ?? 'agent', uncertaintyIds: action.uncertaintyIds };
+  return { decision: kind, reason: text(value.reason) ?? '', phase: text(value.phase) ?? 'unknown', requiredBy: text(value.requiredBy) ?? 'agent', uncertaintyIds: action.uncertaintyIds, tier: text(value.tier) ?? 'standard' };
 }
 
 function capture(root: string, prompt: string): { id: string; checkApproved: boolean; changeApproved: string | undefined; approvalError: string | undefined } {
@@ -156,13 +163,14 @@ function outside(root: string, path: string): boolean {
   return child === '..' || child.startsWith(`..${sep}`) || isAbsolute(child);
 }
 
+/** Silent unless something needs the agent: an approval outcome, a pending proposal, or an open checkpoint. */
 function userPromptSubmit(root: string, prompt: string): Output {
   let id = 'ID';
   const lines: string[] = [];
   try {
+    // Captured even when silent: the controller starts a contract from this prompt at the first protected action.
     const captured = capture(root, prompt);
     id = captured.id;
-    lines.push(`optimizer: this user prompt was captured as prompt:${id}; it can be cited as a human decision source with --source prompt:${id}.`);
     if (captured.checkApproved) lines.push('optimizer: with this prompt the user approved the proposed check commands; they are now the project checks.');
     if (captured.changeApproved) lines.push(`optimizer: with this prompt the user approved \`optimizer ${captured.changeApproved}\`; it is now applied.`);
     if (captured.approvalError) lines.push(`optimizer: the user typed the approval code, but the proposed checks could not be activated: ${captured.approvalError}. Propose a corrected check.`);
@@ -176,32 +184,21 @@ function userPromptSubmit(root: string, prompt: string): Output {
     lines.push(`Pending check proposal (argv, run without a shell):\n${commands(state.pending.argv)}\nThe user approves it by replying with \`approve check ${state.pending.code}\`; nothing else activates it.`);
   }
   const checkpoint = state.sessionId ? state.checkpoint : null;
-  if (!state.sessionId || !checkpoint || checkpoint.decision === 'COMPLETE') {
-    // A managed project's contract comes from the controller; offering an agent-drafted alternative made agents stall for approval.
-    lines.push(...(state.checks.length
-      ? [
-          `Project ${root} is managed by the optimizer and has no open goal contract. Work on the request normally: the first file edit or non-read-only Bash command starts a contract from this prompt automatically (R1 = the prompt verbatim, accepted when every approved project check passes), and the denial names the checkpoint to complete. To add requirements or flag a contradiction, use the contract review (\`review --kind challenge\`) with evidence. Reads and read-only commands are never blocked.`,
-          `Approved project checks:\n${commands(state.checks)}`,
-        ]
-      : [
-          `Project ${root} has no open optimizer goal contract and is unmanaged: it has no approved check, so file edits are not gated and no task here can be verified.`,
-          `To shape a contract, draft it under ${root}/.optimizer/drafts/NAME.md in the dialect below, show the draft to the user with any open human questions, and only after the user explicitly approves run \`optimizer start --project ${root} --request ${root}/.optimizer/drafts/NAME.md\`.`,
-          `The project has no approved check commands yet, and start needs them. Propose the project's test command with \`optimizer propose-check --project ${root} --check CMD\` and show the user the returned argv and approval phrase.`,
-          dialect,
-        ]),
-      'Questions and explanations that change no files need no session.',
-    );
-  } else {
-    lines.push(
-      `Active optimizer session ${state.sessionId}, phase ${checkpoint.phase}. Every optimizer command takes --project ${root} --session ${state.sessionId}.`,
-      state.summary,
-      `Decision ${checkpoint.decision} (required by ${checkpoint.requiredBy}): ${checkpoint.reason}`,
-      `Checkpoint: ${instructions[checkpoint.decision] ?? 'Follow the runtime reason.'}`,
-      `If this prompt answers an open human question, run \`optimizer resolve --project ${root} --session ${state.sessionId} --question ID --source prompt:${id}\`.`,
-      `If the user asks for a different task, work on it: once this session completes, the next change starts a new contract from the new prompt.`,
-    );
+  if (state.sessionId && checkpoint && checkpoint.decision !== 'COMPLETE') {
+    if (checkpoint.tier === 'light' && (checkpoint.decision === 'PROCEED' || checkpoint.decision === 'RUN_VERIFICATION')) {
+      lines.push(`optimizer: light-tier session ${state.sessionId} is open. ${lightInstruction} Commands take --project ${root} --session ${state.sessionId}.`);
+    } else {
+      lines.push(
+        `Active optimizer session ${state.sessionId}, phase ${checkpoint.phase}. Every optimizer command takes --project ${root} --session ${state.sessionId}.`,
+        state.summary,
+        `Decision ${checkpoint.decision} (required by ${checkpoint.requiredBy}): ${checkpoint.reason}`,
+        `Checkpoint: ${instruction(checkpoint)}`,
+        `If this prompt answers an open human question, run \`optimizer resolve --project ${root} --session ${state.sessionId} --question ID --source prompt:${id}\`.`,
+        `If the user asks for a different task, work on it: once this session completes, the next change starts a new contract from the new prompt.`,
+      );
+    }
   }
-  return { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: lines.join('\n').slice(0, 8000) } };
+  return lines.length ? { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: lines.join('\n').slice(0, 8000) } } : undefined;
 }
 
 /** Subagents get the contract so they stay on goal, but never user authority or the duty to finish the task. */
@@ -263,8 +260,10 @@ function preToolUse(root: string, cwd: string, tool: string, toolInput: Record<s
   const checkpoint = isRecord(verdict.checkpoint) ? decision(verdict.checkpoint) : null;
   const lines = [reason.startsWith('optimizer') ? reason : `optimizer: ${reason}`];
   if (verdict.started === true) lines.push(`The optimizer started goal contract ${sessionId ?? ''} from the latest user prompt: R1 is the prompt verbatim and is accepted when every approved project check passes. Add requirements with evidence through \`optimizer review --kind challenge\`; R1 cannot be removed.`);
-  if (checkpoint) lines.push(`Phase ${checkpoint.phase}. Next checkpoint (${checkpoint.decision}): ${instructions[checkpoint.decision] ?? 'Follow the runtime reason.'}`);
+  if (checkpoint) lines.push(`Phase ${checkpoint.phase}. Next checkpoint (${checkpoint.decision}): ${instruction(checkpoint)}`);
   if (sessionId) lines.push(`Every optimizer command takes --project ${root} --session ${sessionId}.`);
+  // The goal dialect only when the agent must draft a contract itself.
+  else if (reason.includes('optimizer start')) lines.push(`Draft the goal under ${root}/.optimizer/drafts/NAME.md, show it to the user, and only after the user approves run \`optimizer start --project ${root} --request FILE\`.`, dialect);
   return deny(lines.join('\n'));
 }
 
@@ -326,7 +325,7 @@ function stop(root: string, claudeSession: string, active: boolean, session: boo
   }
   hookState[claudeSession] = { key, count: count + 1 };
   save();
-  return { decision: 'block', reason: `optimizer: task not verified (phase ${checkpoint.phase}). Decision ${checkpoint.decision}: ${checkpoint.reason}\n${instructions[checkpoint.decision] ?? ''}\nEvery optimizer command takes --project ${root} --session ${sessionId}.` };
+  return { decision: 'block', reason: `optimizer: task not verified (phase ${checkpoint.phase}). Decision ${checkpoint.decision}: ${checkpoint.reason}\n${instruction(checkpoint)}\nEvery optimizer command takes --project ${root} --session ${sessionId}.` };
 }
 
 function hook(raw: string): Output {

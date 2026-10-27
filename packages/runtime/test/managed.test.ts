@@ -57,10 +57,12 @@ if (mode === 'sleep') await new Promise(done => setTimeout(done, 20_000));
 if (mode === 'cooperate') accept();
 const content = process.env.FAKE_FIX === '1' ? ${JSON.stringify(fixed)} : 'export function parseCount(value) { return Number(value); }\\n';
 tool('Edit', { file_path: cwd + '/counter.mjs', old_string: 'x', new_string: 'y' }, () => writeFileSync(cwd + '/counter.mjs', content));
-if (mode !== 'cooperate') tool('Bash', { command: 'echo hacked > counter.mjs' }, () => writeFileSync(cwd + '/counter.mjs', 'hacked'));
+if (mode === 'ignore') tool('Bash', { command: 'echo hacked > counter.mjs' }, () => writeFileSync(cwd + '/counter.mjs', 'hacked'));
 tool('Bash', { command: 'cat ~/.config/optimizer-layer/projects/x.json' }, () => {});
 if (mode === 'cooperate') { accept(); optimizer('claim', '--session', sessionId); }
 record.stop = hook('Stop', { stop_hook_active: false });
+// Light tier: the agent answers the Stop block with the single optimizer step it names.
+if (mode === 'light' && record.stop?.decision === 'block') { record.verify = optimizer('verify', '--session', sessionId); record.stopAfterVerify = hook('Stop', { stop_hook_active: true }); }
 writeFileSync(process.env.FAKE_LOG, JSON.stringify(record));
 process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Finished.', num_turns: 4, usage: { input_tokens: 120, output_tokens: 30 } }));
 `);
@@ -97,7 +99,8 @@ assert.throws(() => parseCount('-1'), RangeError);
   const fake = () => JSON.parse(readFileSync(log, 'utf8')) as {
     args: string[]; prompt: string; mode: number; settingsPath: string; settings: { hooks: Record<string, { matcher?: string; hooks: { command: string }[] }[]> };
     current: { sessionId: string | null; phase: string | null; checkpoint: { decision: string } | null };
-    steps: { tool: string; denied: boolean; reason: string | null }[]; stop: { decision?: string } | null;
+    steps: { tool: string; denied: boolean; reason: string | null }[]; stop: { decision?: string; reason?: string } | null;
+    verify?: { outcome: string }; stopAfterVerify?: unknown;
   };
   return { directory, project, checker, run, fake, log };
 }
@@ -112,7 +115,8 @@ test('managed run refuses a project without an approved check and never launches
 
 test('managed run starts the contract before launch and enforces hooks on an agent that ignores the optimizer', (t) => {
   const { project, checker, run, fake } = setup(t);
-  enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 5000, yes: false });
+  // Standard tier (timeout over the light-tier bound): edits wait for the agent's checkpoints.
+  enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 120_000, yes: false });
   // Managed settings enforce whatever the user's global mode is: drop the opt-in flag the opt-in hooks would require.
   const { optedIn: _, ...config } = readProjectConfig(project) ?? (() => { throw new Error('missing config'); })();
   writeProjectConfig(project, config);
@@ -194,6 +198,21 @@ test('a verified run stays closed: later protected work does not block the next 
   t.after(() => history.close());
   assert.equal(history.get(id).phase, 'verified', 'the first result is kept');
   assert.ok(history.events(id).some(({ event }) => event.payload.kind === 'command.observed'));
+});
+
+test('light tier managed run: the agent edits at once and its only optimizer step is verify', (t) => {
+  const { project, checker, run, fake } = setup(t);
+  enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 5000, yes: false });
+  const result = run({ FAKE_MODE: 'light', FAKE_FIX: '1' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.value?.outcome, 'VERIFIED');
+  const record = fake();
+  assert.equal(record.current.checkpoint?.decision, 'PROCEED', 'no retrieve, assess or review before the first edit');
+  assert.deepEqual(record.steps.map(step => [step.tool, step.denied]), [['Edit', false], ['Bash', true]]);
+  assert.equal(record.stop?.decision, 'block');
+  assert.match(String(record.stop?.reason), /Edit with normal tools, then run `optimizer verify`/);
+  assert.equal(record.verify?.outcome, 'VERIFIED');
+  assert.equal(record.stopAfterVerify, null, 'a verified task stops silently');
 });
 
 test('managed run kills an agent that exceeds its time budget and reports it unverified', (t) => {
