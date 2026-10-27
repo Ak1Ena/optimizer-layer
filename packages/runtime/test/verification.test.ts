@@ -24,7 +24,7 @@ test('changing an external acceptance runner cannot turn a failing requirement i
   assert.notEqual(runtime.next(session.id).kind, 'complete');
 });
 
-test('a changed verifier invalidates requirement labels as well as the completion action', (t) => {
+test('a changed verifier invalidates requirement labels as well as the completion action of an unfinished session', (t) => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'optimizer-stale-proof-')));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const project = join(root, 'project');
@@ -34,9 +34,13 @@ test('a changed verifier invalidates requirement labels as well as the completio
   writeFileSync(verifier, 'process.exitCode=0;');
   const runtime = new Runtime(project);
   t.after(() => runtime.close());
-  const session = runtime.start({ request: '- R1: parseCount works\nAcceptance R1: parseCount passes acceptance', checks: [{ id: 'acceptance', requirementIds: ['R1'], argv: [process.execPath, verifier], timeoutMs: 1000 }] });
+  // R2 stays unverified, so the session is still open when the verifier changes.
+  const session = runtime.start({ request: '- R1: parseCount works\nAcceptance R1: parseCount passes acceptance\n- R2: parseCount is documented\nAcceptance R2: docs check passes', checks: [
+    { id: 'acceptance', requirementIds: ['R1'], argv: [process.execPath, verifier], timeoutMs: 1000 },
+    { id: 'docs', requirementIds: ['R2'], argv: [process.execPath, '-e', 'process.exitCode=1'], timeoutMs: 1000 },
+  ] });
   const context = runtime.retrieve(session.id);
-  runtime.assess(session.id, { kind: 'sufficient', itemIds: context.items.map(item => item.id), rationale: 'The parseCount source covers the requirement.' });
+  runtime.assess(session.id, { kind: 'sufficient', itemIds: context.items.map(item => item.id), rationale: 'The parseCount source covers the requirements.' });
   runtime.review(session.id, { kind: 'accept', goalVersion: runtime.get(session.id).goal.version, itemIds: context.items.map(item => item.id), rationale: 'The requirements and acceptance preserve the request and match the cited source.' });
   assert.deepEqual(runtime.verify(session.id).verifiedRequirementIds, ['R1']);
   writeFileSync(verifier, 'process.exitCode=1;');
@@ -72,7 +76,7 @@ test('operators can pin verifier helper files without supplying fake digests', (
   mkdirSync(project);
   writeFileSync(join(project, 'parseCount.txt'), 'parseCount implementation');
   const helper = join(root, 'helper.mjs');
-  writeFileSync(helper, 'export const accepted = true;');
+  writeFileSync(helper, 'export const accepted = false;');
   const runner = join(root, 'acceptance.mjs');
   writeFileSync(runner, "import {accepted} from './helper.mjs'; process.exitCode=accepted?0:1;");
   const runtime = new Runtime(project);
@@ -81,8 +85,8 @@ test('operators can pin verifier helper files without supplying fake digests', (
   const context = runtime.retrieve(session.id);
   runtime.assess(session.id, { kind: 'sufficient', itemIds: context.items.map(item => item.id), rationale: 'The parseCount source and registered verifier identify the acceptance check.' });
   runtime.review(session.id, { kind: 'accept', goalVersion: runtime.get(session.id).goal.version, itemIds: context.items.map(item => item.id), rationale: 'The requirements and acceptance preserve the request and match the cited source.' });
-  assert.equal(runtime.verify(session.id).action.kind, 'complete');
-  writeFileSync(helper, 'export const accepted = false;');
+  assert.equal(runtime.verify(session.id).outcome, 'FAILED');
+  writeFileSync(helper, 'export const accepted = true;');
   assert.equal(runtime.next(session.id).kind, 'escalate');
   assert.deepEqual(runtime.verify(session.id).verifiedRequirementIds, []);
 });

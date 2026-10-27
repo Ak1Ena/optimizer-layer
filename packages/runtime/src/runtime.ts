@@ -48,6 +48,8 @@ export class Runtime {
 
   /** `trustContext` keeps the reviewed snapshot while executing; verification still requires current context. */
   #current(state: SessionState, trustContext = false): SessionState {
+    // A verified session is a closed historical result: later edits cannot reopen it or change its outcome.
+    if (state.phase === 'verified') return state;
     const contextCurrent = state.context !== null && (trustContext || isContextCurrent(this.projectRoot, state.context));
     const validChecks = new Set(state.checks.filter(artifactsCurrent).map(check => check.id));
     const superseded = new Set(state.decisions.flatMap(item => item.supersedes));
@@ -85,14 +87,23 @@ export class Runtime {
   }
 
   #action(state: SessionState): NextAction {
+    if (state.phase === 'verified') return { kind: 'complete', route: 'none', reason: 'Verified; this session is closed. New work starts a new session.' };
     if (state.checks.some(check => !artifactsCurrent(check))) {
       return { kind: 'escalate', route: 'human', reason: 'Registered verifier artifacts changed; an operator must register a new contract.' };
     }
     return nextAction(state);
   }
 
+  /** A verified session is closed: its result, evidence and phase are final, so no checkpoint command may change it. */
+  #open(sessionId: string): void {
+    if (this.#store.get(sessionId).phase === 'verified') throw new Error('Session is verified and closed; new work starts a new session');
+  }
+
   #transition(sessionId: string, to: Phase, cause: string): void {
-    const stored = this.#store.update(sessionId, state => ({ kind: 'workflow.transitioned', from: state.phase ?? null, to, cause }));
+    const stored = this.#store.update(sessionId, state => {
+      if (state.phase === 'verified') throw new Error(`Session is verified and closed; it cannot move to ${to}`);
+      return { kind: 'workflow.transitioned', from: state.phase ?? null, to, cause };
+    });
     if (to === 'blocked') this.#backfill(sessionId, 'BLOCKED', this.#current(stored));
   }
 
@@ -177,12 +188,12 @@ export class Runtime {
     const id = /^(prompt|run):/.test(promptId) ? promptId : `prompt:${promptId}`;
     const existing = this.#store.sessionForPrompt(id);
     if (existing) {
-      const config = readProjectConfig(this.projectRoot);
-      // Work after a verified task under the same prompt reopens that task instead of starting a new one.
-      if (config?.enabled && config.activeSessionId === null && this.next(existing).kind !== 'complete') {
-        writeProjectConfig(this.projectRoot, { ...config, activeSessionId: existing });
+      // Resume an unfinished session for this prompt; a verified one is closed, so new work gets a new session.
+      if (this.next(existing).kind !== 'complete') {
+        const config = readProjectConfig(this.projectRoot);
+        if (config?.enabled && config.activeSessionId === null) writeProjectConfig(this.projectRoot, { ...config, activeSessionId: existing });
+        return { session: this.get(existing), created: false };
       }
-      return { session: this.get(existing), created: false };
     }
     const prompt = capturedPrompts(this.projectRoot, id.startsWith('run:')).find(item => item.id === id);
     if (!prompt) throw new Error('Unknown hook-captured user prompt');
@@ -283,7 +294,8 @@ export class Runtime {
     return this.#measure(sessionId, 'next', () => {
       const action = this.#action(this.#current(this.#store.get(sessionId)));
       if (action.kind === 'complete' && !this.#readOnly) {
-        // A verified session releases the pointer, so hooks take the no-spawn path again.
+        // Completion is recorded as terminal, and a verified session releases the pointer, so hooks take the no-spawn path again.
+        if (this.#store.get(sessionId).phase !== 'verified') this.#transition(sessionId, 'verified', 'complete');
         const config = readProjectConfig(this.projectRoot);
         if (config?.activeSessionId === sessionId) writeProjectConfig(this.projectRoot, { ...config, activeSessionId: null });
       }
@@ -292,6 +304,7 @@ export class Runtime {
   }
 
   importHistory(sessionId: string, path: string): SessionState {
+    this.#open(sessionId);
     const state = this.#measure(sessionId, 'import-history', () => {
       const decisions = importConversation(this.projectRoot, path);
       return this.#store.update(sessionId, () => ({ kind: 'conversation.imported', decisions }));
@@ -301,6 +314,7 @@ export class Runtime {
   }
 
   retrieve(sessionId: string) {
+    this.#open(sessionId);
     const context = this.#measure(sessionId, 'retrieve', () => {
       const state = this.#store.update(sessionId, current => ({ kind: 'context.retrieved', context: retrieveContext(this.projectRoot, current.goal, current.decisions) }));
       if (!state.context) throw new Error('Context retrieval did not produce a snapshot');
@@ -311,6 +325,7 @@ export class Runtime {
   }
 
   assess(sessionId: string, input: ContextAssessment): SessionState {
+    this.#open(sessionId);
     const assessment = parseAssessment(input);
     const state = this.#measure(sessionId, 'assess', () => this.#store.update(sessionId, stored => {
       const state = this.#current(stored);
@@ -323,6 +338,7 @@ export class Runtime {
   }
 
   resolve(sessionId: string, input: { uncertaintyId: string; source: string; answer?: string }): SessionState {
+    this.#open(sessionId);
     if (input.source.startsWith('prompt:')) {
       const stored = this.#store.get(sessionId);
       if (stored.goal.uncertainties.find(item => item.id === input.uncertaintyId)?.owner === 'human' && !stored.decisions.some(item => item.id === input.source)) {
@@ -356,6 +372,7 @@ export class Runtime {
   }
 
   review(sessionId: string, input: ReviewResponse): SessionState {
+    this.#open(sessionId);
     const response = parseReviewResponse(input);
     const reviewed = this.#measure(sessionId, 'review', () => this.#store.update(sessionId, stored => {
       const state = this.#current(stored);
@@ -385,6 +402,7 @@ export class Runtime {
 
   runCheck(sessionId: string, checkId: string): VerificationEvidence {
     const observed = this.#measure(sessionId, 'check', timing => this.#store.commit(sessionId, stored => {
+      if (stored.phase === 'verified') throw new Error('Session is verified and closed; new work starts a new session');
       const state = this.#current(stored);
       if (state.control.kind !== 'running') throw new Error(`Execution is ${state.control.kind}; resolve cooperative control first`);
       const gate = assessGate(state);
@@ -423,6 +441,7 @@ export class Runtime {
   }
 
   reconsider(sessionId: string, input: { strategy: 'retain' | 'revise'; rationale: string }): SessionState {
+    this.#open(sessionId);
     const rationale = nonempty(input.rationale, 'rationale');
     const state = this.#measure(sessionId, 'reconsider', () => this.#store.update(sessionId, state => {
       if (state.control.kind !== 'paused') throw new Error('A strategy response requires a paused session');
@@ -434,6 +453,8 @@ export class Runtime {
   }
 
   claim(sessionId: string): SessionState {
+    // The documented check → claim → verify protocol may claim after checks already closed the session: a no-op.
+    if (this.#store.get(sessionId).phase === 'verified') return this.get(sessionId);
     const state = this.#measure(sessionId, 'claim', () => this.#store.update(sessionId, () => ({ kind: 'completion.claimed' })));
     this.#sync(sessionId, 'completion.claimed');
     return state;
@@ -452,14 +473,16 @@ export class Runtime {
   block(sessionId: string, cause: string): Decision & { sessionId: string; action: NextAction } {
     const reason = nonempty(cause, 'reason');
     this.#measure(sessionId, 'block', () => {
-      if (this.#store.get(sessionId).phase !== 'blocked') this.#transition(sessionId, 'blocked', reason);
+      const phase = this.#store.get(sessionId).phase;
+      if (phase !== 'blocked' && phase !== 'verified') this.#transition(sessionId, 'blocked', reason);
     });
     return this.decide(sessionId);
   }
 
   /** A protected action in a managed project: start the contract if none is open, then evaluate against it. */
   gate(action: GateAction, activeSessionId: string | null) {
-    let sessionId = activeSessionId;
+    // A pointer left on a verified session (older state) is released, never reopened.
+    let sessionId = activeSessionId && this.next(activeSessionId).kind === 'complete' ? null : activeSessionId;
     let started = false;
     if (!sessionId) {
       const prompt = capturedPrompts(this.projectRoot).findLast(item => !/^approve\s+check\s+[0-9a-f]{4}$/i.test(item.text));
@@ -485,31 +508,27 @@ export class Runtime {
         }
       }
       const verdict = evaluate(state, action, { managed: true, available: true, next });
-      const reopen = verdict.allow && checkpoint.decision === 'COMPLETE';
-      if (reopen) {
-        // Work after verification reopens the task: the pointer comes back, so Stop and the gate track it until it verifies again.
-        const config = readProjectConfig(this.projectRoot);
-        if (config?.enabled && config.activeSessionId !== id) writeProjectConfig(this.projectRoot, { ...config, activeSessionId: id });
-      }
-      const executing = verdict.allow && (checkpoint.phase === 'ready' || reopen) && state.phase !== 'executing';
-      if (executing) this.#transition(id, 'executing', reopen ? `tool-after-verification:${action.tool}` : `tool:${action.tool}`);
+      const executing = verdict.allow && checkpoint.phase === 'ready' && state.phase !== 'executing';
+      if (executing) this.#transition(id, 'executing', `tool:${action.tool}`);
       this.#record(id, executing ? { ...state, phase: 'executing' } : state, next);
       return { ...verdict, sessionId: id, started, checkpoint };
     });
   }
 
   verify(sessionId: string) {
+    // Verifying a closed session only reports its recorded result.
+    const closed = this.#store.get(sessionId).phase === 'verified';
     const state = this.get(sessionId);
     for (const check of state.checks) {
       const action = this.next(sessionId);
-      if (action.kind !== 'execute' && action.kind !== 'verify' && action.kind !== 'complete') break;
+      if (action.kind !== 'execute' && action.kind !== 'verify') break;
       this.runCheck(sessionId, check.id);
     }
-    this.#sync(sessionId, 'verify');
+    if (!closed) this.#sync(sessionId, 'verify');
     const current = this.get(sessionId);
     const action = this.next(sessionId);
     const outcome = verificationOutcome(current, action);
-    if (!this.#readOnly) this.#backfill(sessionId, outcome, current);
+    if (!this.#readOnly && !closed) this.#backfill(sessionId, outcome, current);
     return { action, outcome, phase: this.#store.get(sessionId).phase ?? phaseFor(current, action), verifiedRequirementIds: verifiedRequirementIds(current), evidence: current.evidence };
   }
 

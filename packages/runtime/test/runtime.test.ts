@@ -65,14 +65,14 @@ test('full cycle gates uncertainty, pauses failures, accepts reconsideration and
   assert.ok(runtime.measurements(session.id).some(item => item.externalMs > 0 && item.optimizerMs >= 0));
 });
 
-test('source changes invalidate verification and stale human decisions reopen clarification', (t) => {
+test('source changes invalidate unverified work and stale human decisions reopen clarification', (t) => {
   const { runtime, session, project, history, prepare } = setup(t);
   prepare();
   writeFileSync(join(project, 'counter.mjs'), 'export function parseCount(value) { const n=Number(value); if(n<0)throw new RangeError(); return n; }\n');
   const context = runtime.retrieve(session.id);
   runtime.assess(session.id, { kind: 'sufficient', itemIds: context.items.map(item => item.id), rationale: 'The implementation and decision cover both requirements.' });
   runtime.review(session.id, { kind: 'accept', goalVersion: runtime.get(session.id).goal.version, itemIds: context.items.map(item => item.id), rationale: 'The requirements and acceptance preserve the request and match the cited source.' });
-  assert.equal(runtime.verify(session.id).action.kind, 'complete');
+  assert.notEqual(runtime.next(session.id).kind, 'retrieve');
   writeFileSync(join(project, 'counter.mjs'), 'export function parseCount() { return 0; }\n');
   assert.equal(runtime.next(session.id).kind, 'retrieve');
   writeFileSync(history, readFileSync(history, 'utf8').replace('throw RangeError', 'clamp to zero'));

@@ -173,6 +173,29 @@ test('managed run reports FAILED with a non-zero exit, and VERIFIED with exit 0 
   assert.ok(timings.agentMs > 0 && timings.verifyMs > 0 && timings.totalMs >= timings.agentMs);
 });
 
+test('a verified run stays closed: later protected work does not block the next run, which gets a new session', (t) => {
+  const { project, checker, run } = setup(t);
+  enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 5000, yes: false });
+  const first = run({ FAKE_MODE: 'cooperate', FAKE_FIX: '1' });
+  assert.equal(first.value?.outcome, 'VERIFIED', first.stderr);
+  const id = String(first.value?.sessionId);
+  assert.equal(readProjectConfig(project)?.activeSessionId, null);
+  // A late hook gate still holding the old pointer, then an edit outside any session.
+  const runtime = new Runtime(project);
+  runtime.gate({ kind: 'protected', tool: 'Edit', target: join(project, 'counter.mjs') }, id);
+  runtime.close();
+  writeFileSync(join(project, 'counter.mjs'), 'export function parseCount(value) { return Number(value); }\n');
+  assert.equal(readProjectConfig(project)?.activeSessionId, null);
+  const second = run({ FAKE_MODE: 'cooperate', FAKE_FIX: '1' });
+  assert.equal(second.status, 0, second.stderr);
+  assert.equal(second.value?.outcome, 'VERIFIED');
+  assert.notEqual(second.value?.sessionId, id);
+  const history = new Runtime(project, { readOnly: true });
+  t.after(() => history.close());
+  assert.equal(history.get(id).phase, 'verified', 'the first result is kept');
+  assert.ok(history.events(id).some(({ event }) => event.payload.kind === 'command.observed'));
+});
+
 test('managed run kills an agent that exceeds its time budget and reports it unverified', (t) => {
   const { project, checker, run } = setup(t);
   enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 5000, yes: false });

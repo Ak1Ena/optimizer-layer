@@ -8,7 +8,8 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { classifyBash, decide, evaluate } from '../src/controller.ts';
 import { gate, Runtime } from '../src/runtime.ts';
-import { capturePrompt, enableProject, readProjectConfig } from '../src/project.ts';
+import { Store } from '../src/store.ts';
+import { capturePrompt, enableProject, readProjectConfig, writeProjectConfig } from '../src/project.ts';
 import { configPath } from '../src/user-store.ts';
 
 const cli = resolve('packages/runtime/src/cli.ts');
@@ -224,8 +225,8 @@ test('R1: an agent-initiated start --replace cannot drop the R1 of a controller-
   assert.equal(edit().sessionId, replacement, 'the gate follows the replacement, not the replaced session');
 });
 
-test('R2: a protected action after verification reopens the task until it verifies again', (t) => {
-  const { project, runtime, accept, edit, run } = setup(t);
+test('R2: a verified session is closed: later work never reopens it and starts a new session', (t) => {
+  const { project, promptId, runtime, accept, edit, run } = setup(t);
   const id = edit().sessionId;
   assert.ok(id);
   accept(id);
@@ -233,16 +234,51 @@ test('R2: a protected action after verification reopens the task until it verifi
   accept(id);
   assert.equal(runtime.verify(id).outcome, 'VERIFIED');
   assert.equal(readProjectConfig(project)?.activeSessionId, null);
+  const history = runtime.events(id).length;
+  // A stale hook read of the old pointer must not reopen it either.
+  const stale = runtime.gate({ kind: 'protected', tool: 'Edit', target: join(project, 'counter.mjs') }, id);
   const after = edit();
-  assert.equal(after.allow, true);
-  assert.equal(after.sessionId, id);
-  assert.equal(readProjectConfig(project)?.activeSessionId, id, 'the pointer is back, so Stop tracks the task again');
-  assert.equal(runtime.get(id).phase, 'executing');
+  assert.equal(stale.sessionId, after.sessionId);
+  assert.equal(after.allow, false, 'the new session needs its own context and review');
+  assert.ok(after.sessionId && after.sessionId !== id);
+  assert.deepEqual(runtime.get(after.sessionId).origin, { promptId });
+  assert.equal(readProjectConfig(project)?.activeSessionId, after.sessionId);
   writeFileSync(join(project, 'counter.mjs'), 'export function parseCount() { return 0; }\n');
-  const current = run(['current']);
-  assert.equal(current.value?.sessionId, id);
-  assert.notEqual((current.value?.checkpoint as { decision: string }).decision, 'COMPLETE');
-  assert.notEqual(runtime.verify(id).outcome, 'VERIFIED');
+  assert.equal(runtime.get(id).phase, 'verified');
+  assert.equal(runtime.next(id).kind, 'complete');
+  const closed = runtime.verify(id);
+  assert.equal(closed.outcome, 'VERIFIED', 'the historical result is immutable');
+  assert.deepEqual(closed.verifiedRequirementIds, ['R1']);
+  assert.throws(() => runtime.runCheck(id, runtime.get(id).checks[0]?.id ?? ''), /verified and closed/);
+  assert.throws(() => runtime.retrieve(id), /verified and closed/);
+  assert.equal(runtime.claim(id).phase, 'verified', 'a late claim is a no-op');
+  // A Stop budget or the blocked command with a stale pointer cannot move it out of verified.
+  assert.equal(runtime.block(id, 'Stop budget exhausted').decision, 'COMPLETE');
+  assert.equal(runtime.get(id).phase, 'verified');
+  assert.equal(transitions(runtime, id).at(-1)?.to, 'verified');
+  assert.equal(runtime.events(id).length, history, 'nothing is appended to a closed session; its history is preserved');
+  assert.equal(run(['current']).value?.sessionId, after.sessionId);
+});
+
+test('R2: a pointer to a complete session stored as executing (older databases) is closed and released, not reused', (t) => {
+  const { project, runtime, accept, edit } = setup(t);
+  const id = edit().sessionId;
+  assert.ok(id);
+  accept(id);
+  writeFileSync(join(project, 'counter.mjs'), fixed);
+  accept(id);
+  assert.equal(runtime.verify(id).outcome, 'VERIFIED');
+  // What the removed reopen path left behind: verified, then moved back to executing with the pointer restored.
+  const store = new Store(project);
+  store.update(id, () => ({ kind: 'workflow.transitioned', from: 'verified', to: 'executing', cause: 'tool-after-verification:Edit' }));
+  store.close();
+  const config = readProjectConfig(project);
+  assert.ok(config);
+  writeProjectConfig(project, { ...config, activeSessionId: id });
+  const after = edit();
+  assert.ok(after.sessionId && after.sessionId !== id, 'the gate starts a new session instead of reusing it');
+  assert.equal(runtime.get(id).phase, 'verified');
+  assert.equal(readProjectConfig(project)?.activeSessionId, after.sessionId);
 });
 
 test('§10.10 read-only work in a managed project is never denied and starts no session', (t) => {
