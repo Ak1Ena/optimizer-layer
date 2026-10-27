@@ -1,0 +1,1 @@
+The weekly report sometimes puts Sunday orders into the following week. It looks like the Sunday case in weekOf is off by one; please fix it.

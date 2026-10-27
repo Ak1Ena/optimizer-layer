@@ -1,0 +1,1 @@
+dedupe-users (ambiguous): "the same person" and which record to keep are decided in docs/decisions.md (case-insensitive trimmed email, keep the earliest signup); the visible check only shows case-insensitivity.

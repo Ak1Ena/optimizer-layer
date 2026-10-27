@@ -1,6 +1,6 @@
 # Adaptive execution: verified goals at the lowest practical cost
 
-Status: implemented (light tier, instrumentation). The benchmark is not implemented yet.
+Status: implemented (light tier, instrumentation, benchmark harness in `examples/benchmark/`, validated only with a fake `claude`). No paid benchmark run yet.
 
 ## Objective (amends earlier specs)
 
@@ -91,6 +91,8 @@ Arms, identical tasks, repository snapshots, model, permissions, turn budget and
 Tasks: straightforward fixes; ambiguous requests where a human decision matters; multi-file changes; tasks with a misleading first approach where replanning should help. Several repetitions per arm.
 
 Metrics: verified goal satisfaction (hidden test), false "done" claims, total tokens, wall-clock, cost per verified success, optimizer overhead share.
+
+Harness: `scripts/benchmark-run.mjs` and `scripts/benchmark-report.mjs` over the tasks in `examples/benchmark/` (see its README). Arm B is today's mandatory gates on every task, forced with `optimizer run --tier standard` (recorded as `tier.decided standard`, trigger `forced by run option`); arm C is plain `optimizer run`.
 
 ## Acceptance criteria
 

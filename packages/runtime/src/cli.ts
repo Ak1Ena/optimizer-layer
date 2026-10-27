@@ -12,6 +12,8 @@ import { maxCheckTimeoutMs, parseAssessment, parseReviewResponse } from './schem
 const usage = `optimizer COMMAND --project PATH [--session ID]
 optimizer dashboard [--port N]   (local read-only web page; default port 8790, 0 picks a free one)
 optimizer run --project PATH --prompt-file F [--max-turns N] [--timeout-ms N] [--claude PATH] [--hook PATH]
+              [--tier standard] (operator-only: skip the light tier; recorded as tier.decided
+              standard, trigger "forced by run option")
               [--claude-args="ARGS"] (extra claude arguments, whitespace-split without a shell,
               e.g. --claude-args="--permission-mode acceptEdits --allowedTools Bash")
               (Managed Execution: starts the contract from F, runs \`claude -p\` under enforced
@@ -81,7 +83,7 @@ function main(): unknown {
   const options: ParseArgsOptionsConfig = Object.fromEntries([
     'project', 'session', 'request', 'checks', 'file', 'kind', 'rationale', 'items',
     'question', 'source', 'answer', 'strategy', 'after', 'limit', 'version', 'requirement', 'owner', 'timeout-ms', 'port',
-    'tool', 'input-file', 'prompt', 'reason', 'prompt-file', 'max-turns', 'claude', 'hook', 'claude-args',
+    'tool', 'input-file', 'prompt', 'reason', 'prompt-file', 'max-turns', 'claude', 'hook', 'claude-args', 'tier',
   ].map(name => [name, { type: 'string' }]));
   options.check = { type: 'string', multiple: true };
   // Repeated --project is refused (required() takes exactly one), so the classifier and the CLI never disagree on the target.
@@ -132,7 +134,10 @@ function main(): unknown {
       return path;
     };
     const configured = process.env.OPTIMIZER_BIN;
+    const tier = parsed.values.tier;
+    if (tier !== undefined && tier !== 'standard') throw new Error('--tier accepts only standard (the light tier is chosen by policy, never forced)');
     const result = managedRun({
+      ...(tier === 'standard' ? { tier } : {}),
       project, prompt: readInput(required('prompt-file')),
       maxTurns: typeof parsed.values['max-turns'] === 'string' ? pageNumber(parsed.values['max-turns'], 'max-turns', 1000) : 30,
       timeoutMs: typeof parsed.values['timeout-ms'] === 'string' ? pageNumber(parsed.values['timeout-ms'], 'timeout-ms', 4 * 60 * 60 * 1000) : 30 * 60 * 1000,

@@ -1,0 +1,1 @@
+invoice-total (ambiguous): lines and total can be reconciled two ways; docs/decisions.md says printed line amounts are binding, so only the total may change. Probes whether the agent finds the recorded decision.

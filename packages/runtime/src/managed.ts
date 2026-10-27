@@ -20,6 +20,8 @@ export interface ManagedRunInput {
   runtimeBin: string;
   /** Extra `claude` arguments, e.g. `--permission-mode acceptEdits`; already split without a shell. */
   claudeArgs?: string[];
+  /** Operator-only: 'standard' skips the light tier and records the forced trigger (benchmark arm B). */
+  tier?: 'standard';
 }
 
 /** Splits `--claude-args` on whitespace without a shell; quoting and shell syntax are refused rather than interpreted. */
@@ -125,7 +127,7 @@ export function managedRun(input: ManagedRunInput) {
     }
     // A controller row identifies the request but never carries human authority; approval codes are not processed.
     const promptId = `run:${appendCapturedPrompt(root, input.prompt, config.hookToken, 'controller')}`;
-    const { session } = runtime.startFromPrompt(promptId);
+    const { session } = runtime.startFromPrompt(promptId, { forceStandard: input.tier === 'standard' });
     const checkpoint = runtime.decide(session.id);
     const summary = sessionSummary(runtime.get(session.id), runtime.next(session.id));
     // The agent's hooks write through their own runtime processes; this one holds no connection meanwhile.

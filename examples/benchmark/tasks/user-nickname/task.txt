@@ -1,0 +1,1 @@
+Users need an optional nickname (a string of at most 32 characters). It should be accepted when creating a user, survive saving and loading, and appear in the CSV export.

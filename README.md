@@ -327,8 +327,10 @@ The installer pins the install mode (`OPTIMIZER_MODE='opt-in'` or `'always-on'`)
 
 ```sh
 optimizer run --project /abs/project --prompt-file task.txt [--max-turns 30] [--timeout-ms 1800000] [--claude PATH] [--hook PATH] \
-  [--claude-args="--permission-mode acceptEdits --allowedTools Bash"]
+  [--claude-args="--permission-mode acceptEdits --allowedTools Bash"] [--tier standard]
 ```
+
+`--tier standard` (operator-only, for the benchmark's arm B) skips the light tier: the session starts on the standard tier with `tier.decided standard`, trigger `forced by run option (optimizer run --tier standard)`. No other value is accepted; the light tier is only ever chosen by policy. The working agent cannot set it: it exists only on `run`, which refuses to start inside a managed agent or hook, and the hooks' `start-from-prompt` never passes it.
 
 Managed Execution Mode closes the "hooks not installed" and "agent never called the optimizer" paths for the runs it launches. It needs a managed project: enabled, with at least one approved check. `run` then does five things.
 

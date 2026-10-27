@@ -1,0 +1,1 @@
+Customers report that the TOTAL on some invoices is one cent different from adding up the line amounts printed above it. Make the printed lines and the total agree.

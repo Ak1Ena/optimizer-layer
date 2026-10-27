@@ -1,0 +1,1 @@
+{ "name": "users", "private": true, "type": "module", "scripts": { "test": "node test/visible.test.mjs" } }

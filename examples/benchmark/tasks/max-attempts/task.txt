@@ -1,0 +1,1 @@
+Rename the retries setting to maxAttempts everywhere: the config key, the CLI flag (--max-attempts) and the client. maxAttempts counts the first try too, so maxAttempts = retries + 1. Existing config files that still use retries must keep working.

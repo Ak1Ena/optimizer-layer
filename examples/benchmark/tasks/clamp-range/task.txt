@@ -1,0 +1,1 @@
+clamp(value, min, max) returns the wrong number when value is above max. Fix it.

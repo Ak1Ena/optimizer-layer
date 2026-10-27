@@ -1,0 +1,1 @@
+toCsvRow produces broken CSV when a field contains a comma, a double quote or a line break. Make it quote fields the standard RFC 4180 way.

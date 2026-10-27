@@ -1,0 +1,34 @@
+[
+  {
+    "name": "parse-count",
+    "class": "straightforward"
+  },
+  {
+    "name": "invoice-total",
+    "class": "ambiguous"
+  },
+  {
+    "name": "user-nickname",
+    "class": "multi-file"
+  },
+  {
+    "name": "week-of",
+    "class": "misleading"
+  },
+  {
+    "name": "clamp-range",
+    "class": "straightforward"
+  },
+  {
+    "name": "csv-quote",
+    "class": "straightforward"
+  },
+  {
+    "name": "dedupe-users",
+    "class": "ambiguous"
+  },
+  {
+    "name": "max-attempts",
+    "class": "multi-file"
+  }
+]

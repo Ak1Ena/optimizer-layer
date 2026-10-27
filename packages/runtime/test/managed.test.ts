@@ -215,6 +215,20 @@ test('light tier managed run: the agent edits at once and its only optimizer ste
   assert.equal(record.stopAfterVerify, null, 'a verified task stops silently');
 });
 
+test('managed run --tier standard forces the standard tier on a light-eligible task and records why', (t) => {
+  const { project, checker, run, fake } = setup(t);
+  enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 5000, yes: false });
+  const result = run({ FAKE_MODE: 'light', FAKE_FIX: '1' }, ['--tier', 'standard']);
+  const tier = (result.value?.cost as { tier: { initial: { tier: string; trigger: string } } }).tier;
+  assert.deepEqual([tier.initial.tier, tier.initial.trigger], ['standard', 'forced by run option (optimizer run --tier standard)']);
+  const record = fake();
+  assert.notEqual(record.current.checkpoint?.decision, 'PROCEED', 'the agent must pass the standard checkpoints');
+  assert.equal(record.steps[0]?.denied, true, 'the first edit waits for retrieve, assess and review');
+  const light = run({ FAKE_MODE: 'light', FAKE_FIX: '1' }, ['--tier', 'light']);
+  assert.equal(light.status, 1);
+  assert.match(light.stderr, /--tier accepts only standard/);
+});
+
 test('managed run kills an agent that exceeds its time budget and reports it unverified', (t) => {
   const { project, checker, run } = setup(t);
   enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 5000, yes: false });

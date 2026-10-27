@@ -1,0 +1,1 @@
+The signup export still lists the same person more than once. Fix dedupeUsers so each person appears only once.

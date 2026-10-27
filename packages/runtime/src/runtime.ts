@@ -15,6 +15,9 @@ import { artifactsCurrent, registerArtifacts } from './verification.ts';
 import type { Control, Decision as UserDecision, EventPayload, Goal, Measurement, NextAction, Phase, ReviewResponse, SessionState, Tier, VerificationEvidence } from './types.ts';
 import type { ProjectConfig } from './schema.ts';
 
+/** Recorded as the `tier.decided` trigger when the operator forces the standard tier (benchmark arm B). */
+export const forcedStandardTrigger = 'forced by run option (optimizer run --tier standard)';
+
 export class Runtime {
   readonly projectRoot: string;
   readonly #store: Store;
@@ -214,7 +217,8 @@ export class Runtime {
   }
 
   /** Decision 2/3: the latest captured prompt becomes R1 verbatim, accepted by the approved project checks. Idempotent per prompt. */
-  startFromPrompt(promptId: string): { session: SessionState; created: boolean } {
+  /** `forceStandard` is controller-only (`optimizer run --tier standard`): neither the hook nor any agent-reachable command passes it. */
+  startFromPrompt(promptId: string, options: { forceStandard?: boolean } = {}): { session: SessionState; created: boolean } {
     const id = /^(prompt|run):/.test(promptId) ? promptId : `prompt:${promptId}`;
     const existing = this.#store.sessionForPrompt(id);
     if (existing) {
@@ -227,7 +231,7 @@ export class Runtime {
     }
     const prompt = capturedPrompts(this.projectRoot, id.startsWith('run:')).find(item => item.id === id);
     if (!prompt) throw new Error('Unknown hook-captured user prompt');
-    const session = this.#begin({ request: prompt.text }, prompt);
+    const session = this.#begin({ request: prompt.text, forceStandard: options.forceStandard === true }, prompt);
     try {
       this.retrieve(session.id);
     } catch {
@@ -236,7 +240,7 @@ export class Runtime {
     return { session: this.get(session.id), created: true };
   }
 
-  #begin(input: { request: string; checks?: unknown; replace?: boolean; agent?: boolean }, prompt: UserDecision | null): SessionState {
+  #begin(input: { request: string; checks?: unknown; replace?: boolean; agent?: boolean; forceStandard?: boolean }, prompt: UserDecision | null): SessionState {
     const id = `session-${randomUUID()}`;
     const config = readProjectConfig(this.projectRoot);
     const enabled = config?.enabled === true ? config : null;
@@ -302,7 +306,7 @@ export class Runtime {
         failureStreak: { signature: '', count: 0 }, completionClaimed: false,
       };
       this.#store.append({ version: 1, id: randomUUID(), sessionId: id, producer: 'runtime', at: new Date().toISOString(), payload: { kind: 'session.started', state } });
-      const trigger = this.#startTier(state, input.checks === undefined && enabled !== null, priorSession);
+      const trigger = input.forceStandard ? forcedStandardTrigger : this.#startTier(state, input.checks === undefined && enabled !== null, priorSession);
       this.#store.update(id, () => ({ kind: 'tier.decided', tier: trigger ? 'standard' : 'light', trigger: trigger ?? lightTierRule }));
       if (trigger) return this.#store.get(id);
       // Recorded, never asked of the agent: both stay visible in history with the rule that justified them.

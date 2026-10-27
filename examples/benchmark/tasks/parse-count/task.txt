@@ -1,0 +1,1 @@
+parseCount turns invalid input into 0, which hides bad data. Make it accept only non-negative safe integers and strings of decimal digits, and throw a RangeError for anything else.
