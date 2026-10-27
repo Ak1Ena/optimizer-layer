@@ -5,7 +5,7 @@ import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep 
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
-import { runOptimizer, type OptimizerCommand } from './index.ts';
+import { injected, runOptimizer, type OptimizerCommand } from './index.ts';
 import { deniedBash } from './bash-guard.ts';
 
 type Output = Record<string, unknown> | undefined;
@@ -107,10 +107,15 @@ function argvList(value: unknown): string[][] {
   return Array.isArray(value) ? value.filter(item => Array.isArray(item)).map(item => item.map(String)) : [];
 }
 
+/** This invocation's overhead, appended to the project's hook-metrics.jsonl for `optimizer metrics`; bytes and time, never invented tokens. */
+const trace: { root: string | null; event: string; sessionId: string | null; calls: { command: string; elapsedMs: number; ok: boolean }[] } = { root: null, event: '', sessionId: null, calls: [] };
+
 function call(root: string, command: OptimizerCommand, options: Record<string, string> = {}, sessionId?: string): Record<string, unknown> {
   const executable = process.env.OPTIMIZER_BIN;
   if (!executable) throw new Error('OPTIMIZER_BIN is not set; re-run optimizer-claude-hook install');
+  const started = performance.now();
   const result = runOptimizer({ executable, projectRoot: root, command, options, timeoutMs: callTimeoutMs, ...(sessionId === undefined ? {} : { sessionId }) });
+  trace.calls.push({ command, elapsedMs: performance.now() - started, ok: result.kind === 'response' && result.exitCode === 0 });
   if (result.kind !== 'response' || result.exitCode !== 0 || !isRecord(result.value)) {
     throw new Error(`optimizer ${command} failed: ${result.kind === 'response' ? JSON.stringify(result.value) : result.stderr.trim() || ('reason' in result ? result.reason : result.kind)}`);
   }
@@ -131,6 +136,7 @@ function withFile<T>(content: string, use: (file: string) => T): T {
 
 function current(root: string): Current {
   const value = call(root, 'current');
+  trace.sessionId = text(value.sessionId) ?? trace.sessionId;
   const pending = value.pendingChecks;
   return {
     sessionId: text(value.sessionId) ?? null,
@@ -254,9 +260,10 @@ function preToolUse(root: string, cwd: string, tool: string, toolInput: Record<s
     // Decision 5: in a managed project or task a silent runtime must not let protected work through. Bash is not classified here, so all of it waits.
     return deny(`optimizer unavailable: a managed task is active and the runtime could not answer (${error instanceof Error ? error.message : String(error)}), so file edits and Bash commands are denied. Read, Grep and Glob still work; ask the user to check the optimizer installation.`.replaceAll('\n', ' '));
   }
+  const sessionId = text(verdict.sessionId);
+  trace.sessionId = sessionId ?? trace.sessionId;
   if (verdict.allow === true) return undefined;
   const reason = text(verdict.reason) ?? 'action denied';
-  const sessionId = text(verdict.sessionId);
   const checkpoint = isRecord(verdict.checkpoint) ? decision(verdict.checkpoint) : null;
   const lines = [reason.startsWith('optimizer') ? reason : `optimizer: ${reason}`];
   if (verdict.started === true) lines.push(`The optimizer started goal contract ${sessionId ?? ''} from the latest user prompt: R1 is the prompt verbatim and is accepted when every approved project check passes. Add requirements with evidence through \`optimizer review --kind challenge\`; R1 cannot be removed.`);
@@ -370,6 +377,9 @@ function hook(raw: string): Output {
     // A folder the user has not enabled gets only the spawn-free guards, so the agent cannot enable it or forge approvals.
     return input.hook_event_name === 'PreToolUse' && tool && isRecord(input.tool_input) ? preToolUse(root, cwd, tool, input.tool_input, null) : undefined;
   }
+  trace.root = root;
+  trace.event = text(input.hook_event_name) ?? '';
+  trace.sessionId = text(config?.activeSessionId) ?? null;
   const token = text(config?.hookToken);
   // A project without config gets its token from the runtime at the first capture.
   if (token) process.env.OPTIMIZER_HOOK_TOKEN = token;
@@ -536,10 +546,33 @@ if (mode === 'ensure') {
   process.exitCode = 1;
 } else {
   // Never break Claude Code on hook infrastructure errors: fail open with a one-line diagnostic.
+  let output: Output;
   try {
-    const output = hook(readFileSync(0, 'utf8'));
+    output = hook(readFileSync(0, 'utf8'));
     if (output) process.stdout.write(JSON.stringify(output) + '\n');
   } catch (error) {
     process.stderr.write(`optimizer-claude-hook: ${error instanceof Error ? error.message : String(error)}\n`.replaceAll(/\n(?!$)/g, ' '));
+  }
+  writeTrace(output);
+}
+
+/** Appends one line per invocation of a tracked project; metrics never break a hook or create .optimizer/. */
+function writeTrace(output: Output): void {
+  // shortcut: invocations outside a session are not attributable, so not written; the file is never rotated, add rotation if it grows large.
+  if (!trace.root || !trace.sessionId) return;
+  try {
+    const directory = join(trace.root, '.optimizer');
+    if (!existsSync(directory) || lstatSync(directory).isSymbolicLink()) return;
+    const shown = injected(output);
+    // performance.now() counts from process start, so Node.js startup is part of the hook's cost.
+    const line = { at: new Date().toISOString(), sessionId: trace.sessionId, event: trace.event, elapsedMs: performance.now(), injectedAs: shown.as, injectedBytes: shown.bytes, calls: trace.calls };
+    const descriptor = openSync(join(directory, 'hook-metrics.jsonl'), constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW, 0o600);
+    try {
+      writeSync(descriptor, JSON.stringify(line) + '\n');
+    } finally {
+      closeSync(descriptor);
+    }
+  } catch {
+    // Overhead metrics are best effort.
   }
 }

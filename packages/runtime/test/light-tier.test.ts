@@ -266,3 +266,31 @@ test('runCheck rejects an unknown check before any context refresh', (t) => {
   assert.throws(() => runtime.runCheck(id, 'nope'), /Unknown registered check/);
   assert.equal(retrievals(), before);
 });
+
+test('cost breakdown: rework, tier escalations and component time come from recorded events; unmeasured values stay null', (t) => {
+  const { runtime, edit } = setup(t);
+  const id = String(edit().sessionId);
+  runtime.runCheck(id, 'check-1');
+  runtime.runCheck(id, 'check-1');
+  runtime.reconsider(id, { strategy: 'revise', rationale: 'The guard is missing; add it.' });
+  const cost = runtime.cost(id);
+  assert.deepEqual(cost.rework, {
+    checksRun: 2, failedChecks: 2, retrievals: 1, reRetrievals: 0, agentAssessments: 0, reAssessments: 0, agentReviews: 0, reReviews: 0,
+    challenges: 0, reconsiderations: 1, stopBlocks: 0, blocked: 0, revertedEdits: null,
+  });
+  assert.equal(cost.tier.initial?.tier, 'light');
+  assert.deepEqual(cost.tier.escalations.map(item => item.tier), ['standard']);
+  assert.match(cost.tier.escalations[0]?.trigger ?? '', /^reconsideration: Check check-1 failed twice/);
+  assert.equal(cost.components.verification.operations, 2);
+  assert.ok(cost.components.verification.externalMs > 0, 'check subprocess time is attributed to verification');
+  assert.equal(cost.components.replanning.operations, 1);
+  assert.ok(cost.components.contextRetrieval.operations >= 1 && cost.components.decision.operations > 0);
+  for (const [name, component] of Object.entries(cost.components)) assert.equal(component.modelTokens, name === 'other' ? null : 0, 'mapped components call no model; unmapped usage is unknown');
+  assert.equal(cost.components.other.operations, 0, 'every measured operation maps to a component');
+  // In-process use: no agent report, no hook ran.
+  assert.equal(cost.agent.inputTokens, null);
+  assert.equal(cost.agent.outputTokens, null);
+  assert.equal(cost.agent.turns, null);
+  assert.equal(cost.injected.systemPromptBytes, null);
+  assert.equal(cost.hooks.invocations, 0);
+});

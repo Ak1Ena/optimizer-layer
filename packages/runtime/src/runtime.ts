@@ -10,8 +10,9 @@ import { assertSafeArgv, readProjectConfig, writeProjectConfig } from './project
 import { canonicalRoot } from './user-store.ts';
 import { nonempty, parseAssessment, parseChecks, parseReviewResponse, type AgentAssessment } from './schema.ts';
 import { runCommand } from './process.ts';
+import { costBreakdown, readHookTraces } from './cost.ts';
 import { artifactsCurrent, registerArtifacts } from './verification.ts';
-import type { Control, Decision as UserDecision, Goal, Measurement, NextAction, Phase, ReviewResponse, SessionState, Tier, VerificationEvidence } from './types.ts';
+import type { Control, Decision as UserDecision, EventPayload, Goal, Measurement, NextAction, Phase, ReviewResponse, SessionState, Tier, VerificationEvidence } from './types.ts';
 import type { ProjectConfig } from './schema.ts';
 
 export class Runtime {
@@ -580,6 +581,12 @@ export class Runtime {
   events(sessionId: string) { return this.#store.events(sessionId); }
   sessions(): string[] { return this.#store.sessionIds(); }
   measurements(sessionId: string): Measurement[] { return this.#store.measurements(sessionId); }
+  /** Where the session's cost went; unmeasured values stay null. */
+  cost(sessionId: string) { return costBreakdown(this.#store.events(sessionId).map(item => item.event), this.#store.measurements(sessionId), readHookTraces(this.projectRoot, sessionId)); }
+  /** Only the managed run calls this, with what the agent's own process reported; no CLI command reaches it. */
+  recordAgentUsage(sessionId: string, report: Omit<Extract<EventPayload, { kind: 'agent.usage' }>, 'kind' | 'source'>): void {
+    this.#store.update(sessionId, () => ({ kind: 'agent.usage', source: 'claude-code-json', ...report }));
+  }
   close(): void { this.#store.close(); }
 }
 

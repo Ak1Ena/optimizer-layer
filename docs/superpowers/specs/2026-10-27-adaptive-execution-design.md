@@ -1,6 +1,6 @@
 # Adaptive execution: verified goals at the lowest practical cost
 
-Status: implemented (light tier). Instrumentation and the benchmark are not implemented yet.
+Status: implemented (light tier, instrumentation). The benchmark is not implemented yet.
 
 ## Objective (amends earlier specs)
 
@@ -74,6 +74,13 @@ Recorded per session, from real sources only; missing values stay `null`, never 
 - Retries and rework: failed checks, re-retrievals, re-reviews, reverted edits.
 - Tier chosen and every escalation with its trigger.
 
+Implemented as `optimizer metrics --project P --session ID` (cost breakdown beside the raw measurements) and the `cost` block of `optimizer run` output, from `cost.ts`:
+- Agent tokens: `optimizer run` appends an `agent.usage` event with `num_turns`, `total_cost_usd`, `duration_ms`, `duration_api_ms`, `usage` (including `iterations` when present) and `modelUsage` copied verbatim from `claude -p --output-format json`. Per-turn values are what Claude Code reports in `usage.iterations`; nothing else is split. Hook mode: `null` (see Q4).
+- Injected context: UTF-8 bytes of the `run` system prompt and of each hook output that reaches the model (`additionalContext`, deny reasons, Stop block reasons), per event. No token count: no provider count of these strings is available.
+- Components: existing measurements mapped to Goal Intelligence, Context retrieval, Decision, Replanning, Verification (and `other`); `modelTokens: 0` for each.
+- Hook overhead: the hook appends one line per invocation to `.optimizer/hook-metrics.jsonl` with its process wall clock and each runtime CLI call it made.
+- Rework: from session events (failed checks, re-retrievals, re-assessments, re-reviews, challenges, reconsiderations, `blocked`) and hook lines (Stop blocks). Reverted edits stay `null`: the runtime does not observe them.
+
 ### Benchmark (requires explicit user approval before paid runs)
 
 Arms, identical tasks, repository snapshots, model, permissions, turn budget and hidden acceptance tests:
@@ -102,4 +109,5 @@ Metrics: verified goal satisfaction (hidden test), false "done" claims, total to
 ## Open questions
 
 - Question local Q4: Can hook mode read per-turn token usage reliably from the Claude Code transcript, or only `optimizer run`?
+  Answer (2026-10-27): readable, but not proven reliable, so hook mode records `null`. A sample of local transcripts from Claude Code 2.1.283 to 2.1.300 shows each API response written as several `assistant` lines (one per content block) sharing `message.id`, all with identical `usage` (final output tokens, cache fields, `iterations`), plus `<synthetic>` messages with zero usage. Summing per unique `message.id` would therefore work on these versions. It is not used because: the transcript is an undocumented internal format with no stability promise (older versions are reported to have written streaming placeholder `output_tokens`); subagent turns are written to separate files; the Stop hook can run before the last line is flushed; and no transcript sum has been checked against the `claude -p` result `usage` of the same session. One managed run comparing the two would settle it; until then only `optimizer run` reports agent tokens.
 - Question local Q5: Check-duration threshold for "inexpensive" (default 60 s) — measure on real projects.

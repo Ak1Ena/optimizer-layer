@@ -91,6 +91,10 @@ const payload = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('workflow.transitioned'), from: phase.nullable(), to: phase, cause: text }).strict(),
   z.object({ kind: z.literal('tier.decided'), tier: z.enum(['light', 'standard']), trigger: text }).strict(),
   z.object({
+    kind: z.literal('agent.usage'), source: z.literal('claude-code-json'), systemPromptBytes: count, turns: count.nullable(), totalCostUsd: z.number().nonnegative().nullable(),
+    durationMs: z.number().nonnegative().nullable(), durationApiMs: z.number().nonnegative().nullable(), usage: z.record(z.string(), z.unknown()).nullable(), modelUsage: z.record(z.string(), z.unknown()).nullable(),
+  }).strict(),
+  z.object({
     kind: z.literal('decision.recorded'), decisionId: id, features, availableActions: z.array(decisionKind).min(1), chosenAction: decisionKind,
     decisionModelVersion: id, shadow: z.object({ version: id, ranking: z.array(ranked) }).strict().optional(),
   }).strict(),

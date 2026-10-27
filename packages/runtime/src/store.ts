@@ -53,6 +53,7 @@ export function reduceEvent(state: SessionState | null, event: Event): SessionSt
     case 'strategy.resolved': return { ...state, control: payload.control, failureStreak: { signature: '', count: 0 }, completionClaimed: false };
     case 'completion.claimed': return { ...state, completionClaimed: true };
     case 'session.replaced':
+    case 'agent.usage':
     case 'decision.recorded':
     case 'decision.outcome': return state;
     case 'tier.decided': {

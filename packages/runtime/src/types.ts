@@ -136,6 +136,8 @@ export type EventPayload =
   | { kind: 'session.replaced'; replacedBy: string }
   | { kind: 'workflow.transitioned'; from: Phase | null; to: Phase; cause: string }
   | { kind: 'tier.decided'; tier: Tier; trigger: string }
+  /** What the working agent reported about its own run, copied verbatim; absent values stay null. */
+  | { kind: 'agent.usage'; source: 'claude-code-json'; systemPromptBytes: number; turns: number | null; totalCostUsd: number | null; durationMs: number | null; durationApiMs: number | null; usage: Record<string, unknown> | null; modelUsage: Record<string, unknown> | null }
   | {
     kind: 'decision.recorded'; decisionId: string; features: StateFeatures; availableActions: DecisionAction[]; chosenAction: DecisionKind;
     decisionModelVersion: string; shadow?: { version: string; ranking: RankedAction[] } | undefined;

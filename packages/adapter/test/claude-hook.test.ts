@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, symlinkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, symlinkSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,6 +10,7 @@ import { test } from 'node:test';
 import { disableProject, enableProject } from '../../runtime/src/project.ts';
 import { optimizerHookOnly } from '../../runtime/src/bash.ts';
 import { hookOnly } from '../src/bash-guard.ts';
+import { injected } from '../src/index.ts';
 
 const hookScript = fileURLToPath(new URL('../src/claude-hook.ts', import.meta.url));
 const runtimeCli = fileURLToPath(new URL('../../runtime/src/cli.ts', import.meta.url));
@@ -396,6 +397,40 @@ test('Stop never writes loop-guard state through a planted symlink', t => {
   assert.equal(readFileSync(victim, 'utf8'), 'keep');
 });
 
+test('hook metrics are never written through a symlinked file or .optimizer directory, and Bash cannot append to them', t => {
+  const { directory, project, checker, optimizer, hook } = setup(t);
+  enableProject(project, { commands: [`node ${checker}`], timeoutMs: 120_000, yes: false });
+  writeFileSync(join(project, 'goal.md'), '- R1: greeting works.\nAcceptance R1: greeting returns hello.\n');
+  const sessionId = String(field(optimizer('start', '--request', join(project, 'goal.md')), 'id'));
+  for (const command of ['echo x >> .optimizer/hook-metrics.jsonl', 'echo x > .optimizer/hook-metrics.jsonl', `tee -a ${join(project, '.optimizer', 'hook-metrics.jsonl')}`]) {
+    const verdict = hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command } }).output;
+    assert.equal(field(verdict, 'hookSpecificOutput', 'permissionDecision'), 'deny', command);
+  }
+  const lines = () => readFileSync(join(project, '.optimizer', 'hook-metrics.jsonl'), 'utf8').trim().split('\n');
+  assert.equal(lines().length, 3, 'each denied invocation was recorded');
+  assert.ok(lines().every(line => JSON.parse(line).sessionId === sessionId));
+  const victim = join(directory, 'victim.txt');
+  writeFileSync(victim, 'keep');
+  rmSync(join(project, '.optimizer', 'hook-metrics.jsonl'));
+  symlinkSync(victim, join(project, '.optimizer', 'hook-metrics.jsonl'));
+  hook(edit(join(project, 'greeting.mjs')));
+  assert.equal(readFileSync(victim, 'utf8'), 'keep', 'O_NOFOLLOW refuses the planted file link');
+  rmSync(join(project, '.optimizer', 'hook-metrics.jsonl'));
+  const moved = join(directory, 'moved');
+  renameSync(join(project, '.optimizer'), moved);
+  symlinkSync(moved, join(project, '.optimizer'));
+  hook(edit(join(project, 'greeting.mjs')));
+  assert.equal(existsSync(join(moved, 'hook-metrics.jsonl')), false, 'a symlinked .optimizer directory gets no metrics');
+});
+
+test('injected() counts every model-visible field of a hook output and never systemMessage', () => {
+  const both = { hookSpecificOutput: { hookEventName: 'PreToolUse', additionalContext: 'héllo', permissionDecision: 'deny', permissionDecisionReason: 'no' }, systemMessage: 'user only' };
+  assert.deepEqual(injected(both), { as: ['additionalContext', 'permissionDecisionReason'], bytes: Buffer.byteLength('héllo') + 2 });
+  assert.deepEqual(injected({ decision: 'block', reason: 'verify first' }), { as: ['reason'], bytes: 12 });
+  assert.deepEqual(injected({ decision: 'approve', reason: 'ignored', systemMessage: 'x' }), { as: [], bytes: 0 });
+  assert.deepEqual(injected(undefined), { as: [], bytes: 0 });
+});
+
 test('runtime unavailable inside a managed task denies protected actions and passes reads; outside a task it fails open (§10 case 7)', t => {
   const { project, checker, optimizer, hook } = setup(t);
   enableProject(project, { commands: [`node ${checker}`], timeoutMs: 30_000, yes: false });
@@ -479,6 +514,18 @@ test('light tier: idle prompts inject nothing, the first edit is allowed, and th
   assert.equal(field(optimizer('verify', '--session', sessionId), 'outcome'), 'VERIFIED', 'stale context after the edit does not block light verification');
   assert.equal(hook({ hook_event_name: 'Stop', stop_hook_active: true }).output, undefined);
   assert.deepEqual(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'thanks' }), { output: undefined, stderr: '' }, 'verified: idle again');
+  // Instrumentation: the exact bytes this session's hooks injected, and their own wall clock.
+  const metrics = optimizer('metrics', '--session', sessionId);
+  assert.deepEqual(field(metrics, 'injected', 'byEvent'), {
+    UserPromptSubmit: { injections: 1, bytes: Buffer.byteLength(context) },
+    Stop: { injections: 1, bytes: Buffer.byteLength(stop) },
+  });
+  assert.equal(field(metrics, 'injected', 'hookBytes'), Buffer.byteLength(context) + Buffer.byteLength(stop));
+  assert.equal(field(metrics, 'injected', 'systemPromptBytes'), null);
+  assert.equal(field(metrics, 'rework', 'stopBlocks'), 1);
+  assert.ok(Number(field(metrics, 'hooks', 'elapsedMs')) > 0);
+  assert.ok(Number(field(metrics, 'hooks', 'byCommand', 'gate', 'elapsedMs')) > 0, 'runtime CLI calls made by the hook are timed');
+  assert.equal(field(metrics, 'agent', 'outputTokens'), null, 'hook mode reads no transcript usage');
 });
 
 test('an idle prompt is silent, but a pending check proposal is still shown', t => {

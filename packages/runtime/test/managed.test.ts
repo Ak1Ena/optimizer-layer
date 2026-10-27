@@ -64,7 +64,7 @@ record.stop = hook('Stop', { stop_hook_active: false });
 // Light tier: the agent answers the Stop block with the single optimizer step it names.
 if (mode === 'light' && record.stop?.decision === 'block') { record.verify = optimizer('verify', '--session', sessionId); record.stopAfterVerify = hook('Stop', { stop_hook_active: true }); }
 writeFileSync(process.env.FAKE_LOG, JSON.stringify(record));
-process.stdout.write(JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Finished.', num_turns: 4, usage: { input_tokens: 120, output_tokens: 30 } }));
+process.stdout.write(process.env.FAKE_REPORT ?? JSON.stringify({ type: 'result', subtype: 'success', is_error: false, result: 'Finished.', num_turns: 4, usage: { input_tokens: 120, output_tokens: 30 } }));
 `);
   chmodSync(path, 0o755);
   return path;
@@ -226,6 +226,70 @@ test('managed run kills an agent that exceeds its time budget and reports it unv
   assert.equal(result.value?.agentExitCode, null);
   assert.equal(result.value?.usage, null, 'no usage is invented when the agent reported none');
   assert.notEqual(result.value?.outcome, 'VERIFIED');
+  const agent = (result.value?.cost as { agent: Record<string, unknown> }).agent;
+  for (const name of ['turns', 'totalCostUsd', 'durationMs', 'durationApiMs', 'inputTokens', 'cacheReadTokens', 'cacheWriteTokens', 'outputTokens', 'iterations', 'modelUsage']) {
+    assert.equal(agent[name], null, `${name} stays null without a report`);
+  }
+});
+
+test('instrumentation: malformed or absent usage fields in the agent report become null, never numbers', (t) => {
+  const { project, checker, run } = setup(t);
+  enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 120_000, yes: false });
+  // duration_ms is absent; every other field has the wrong type or sign.
+  const report = { type: 'result', result: 'Finished.', num_turns: -1, total_cost_usd: '0.42', duration_api_ms: -3, usage: 'lots', modelUsage: [1] };
+  const value = run({ FAKE_MODE: 'ignore', FAKE_REPORT: JSON.stringify(report) }).value;
+  assert.ok(value);
+  assert.equal(value.usage, null);
+  assert.equal(value.turns, null);
+  assert.deepEqual((value.cost as { agent: unknown }).agent, {
+    source: 'claude-code-json', turns: null, totalCostUsd: null, durationMs: null, durationApiMs: null,
+    inputTokens: null, cacheReadTokens: null, cacheWriteTokens: null, outputTokens: null, iterations: null, modelUsage: null,
+  });
+});
+
+test('instrumentation: the run copies Claude Code usage exactly and reports where the cost went', (t) => {
+  const { project, checker, run, fake } = setup(t);
+  enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 120_000, yes: false });
+  const usage = {
+    input_tokens: 7, cache_creation_input_tokens: 1585, cache_read_input_tokens: 378_276, output_tokens: 969,
+    server_tool_use: { web_search_requests: 0 }, iterations: [{ input_tokens: 4, output_tokens: 500 }, { input_tokens: 3, output_tokens: 469 }],
+  };
+  const modelUsage = { 'claude-sonnet-test': { inputTokens: 7, outputTokens: 969, cacheReadInputTokens: 378_276, cacheCreationInputTokens: 1585, costUSD: 0.4211 } };
+  const report = { type: 'result', subtype: 'success', is_error: false, result: 'Finished.', num_turns: 17, duration_ms: 114_000, duration_api_ms: 98_000, total_cost_usd: 0.4211, usage, modelUsage };
+  const result = run({ FAKE_MODE: 'ignore', FAKE_REPORT: JSON.stringify(report) });
+  const value = result.value;
+  assert.ok(value, result.stderr);
+  assert.deepEqual(value.usage, usage);
+  type Cost = {
+    agent: Record<string, unknown>; injected: { systemPromptBytes: number | null; hookBytes: number; byEvent: Record<string, { injections: number; bytes: number }> };
+    hooks: { invocations: number; elapsedMs: number; runtimeCalls: number; byEvent: Record<string, { invocations: number }>; byCommand: Record<string, { calls: number; elapsedMs: number }> };
+    components: Record<string, { operations: number; modelTokens: number | null }>; rework: Record<string, unknown>;
+  };
+  const cost = value.cost as Cost;
+  assert.deepEqual(cost.agent, {
+    source: 'claude-code-json', turns: 17, totalCostUsd: 0.4211, durationMs: 114_000, durationApiMs: 98_000,
+    inputTokens: 7, cacheReadTokens: 378_276, cacheWriteTokens: 1585, outputTokens: 969, iterations: usage.iterations, modelUsage,
+  });
+  const record = fake();
+  assert.equal(cost.injected.systemPromptBytes, Buffer.byteLength(record.args[record.args.indexOf('--append-system-prompt') + 1] ?? ''));
+  // Every deny reason and the Stop block reason the fake agent received, byte for byte.
+  const denied = record.steps.filter(step => step.denied).map(step => Buffer.byteLength(step.reason ?? ''));
+  assert.deepEqual(cost.injected.byEvent.PreToolUse, { injections: denied.length, bytes: denied.reduce((a, b) => a + b, 0) });
+  assert.deepEqual(cost.injected.byEvent.Stop, { injections: 1, bytes: Buffer.byteLength(record.stop?.reason ?? '') });
+  assert.equal(cost.rework.stopBlocks, 1);
+  assert.equal(cost.hooks.byEvent.PreToolUse?.invocations, record.steps.length);
+  assert.equal(cost.hooks.byEvent.Stop?.invocations, 1);
+  assert.ok(cost.hooks.elapsedMs > 0 && (cost.hooks.byCommand.gate?.calls ?? 0) >= 1 && (cost.hooks.byCommand.gate?.elapsedMs ?? 0) > 0);
+  for (const [name, component] of Object.entries(cost.components)) assert.equal(component.modelTokens, name === 'other' ? null : 0);
+  assert.equal(cost.components.other?.operations, 0, 'every operation the run measured maps to a component');
+  assert.ok((cost.components.goalIntelligence?.operations ?? 0) >= 1 && (cost.components.contextRetrieval?.operations ?? 0) >= 1);
+  // `optimizer metrics` reads the same breakdown from the session.
+  const metrics = JSON.parse(spawnSync(process.execPath, [cli, 'metrics', '--project', project, '--session', String(value.sessionId)], { encoding: 'utf8' }).stdout) as Cost & { measurements: unknown[] };
+  const { measurements, ...breakdown } = metrics;
+  assert.ok(measurements.length > 0);
+  assert.deepEqual(breakdown.agent, cost.agent);
+  assert.deepEqual(breakdown.injected, cost.injected);
+  assert.deepEqual(breakdown.hooks, cost.hooks);
 });
 
 test('S3: managed-run requests carry no human authority, and run refuses to start inside a managed agent or hook', (t) => {

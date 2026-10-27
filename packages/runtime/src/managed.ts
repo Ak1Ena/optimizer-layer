@@ -79,26 +79,29 @@ function protocol(root: string, sessionId: string, summary: string, decision: st
   ].join('\n');
 }
 
-interface AgentReport { finalMessage: string | null; turns: number | null; usage: unknown; isError: boolean | null }
+interface AgentReport {
+  finalMessage: string | null; turns: number | null; usage: Record<string, unknown> | null; isError: boolean | null;
+  totalCostUsd: number | null; durationMs: number | null; durationApiMs: number | null; modelUsage: Record<string, unknown> | null;
+}
+
+const record = (value: unknown): Record<string, unknown> | null => typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : null;
+const amount = (value: unknown): number | null => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 
 /** Reads Claude Code `--output-format json`; absent fields stay null, never invented. */
 function agentReport(stdout: string): AgentReport {
   try {
-    const value: unknown = JSON.parse(stdout);
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('not an object');
-    const field = (name: string): unknown => (name in value ? (value as Record<string, unknown>)[name] : undefined);
-    const result = field('result');
-    const turns = field('num_turns');
-    const usage = field('usage');
-    const isError = field('is_error');
+    const value = record(JSON.parse(stdout));
+    if (!value) throw new Error('not an object');
+    const { result, num_turns: turns, is_error: isError } = value;
     return {
       finalMessage: typeof result === 'string' ? result.slice(0, 20_000) : null,
-      turns: typeof turns === 'number' ? turns : null,
-      usage: typeof usage === 'object' && usage !== null ? usage : null,
+      turns: Number.isSafeInteger(turns) && Number(turns) >= 0 ? Number(turns) : null,
+      usage: record(value.usage),
       isError: typeof isError === 'boolean' ? isError : null,
+      totalCostUsd: amount(value.total_cost_usd), durationMs: amount(value.duration_ms), durationApiMs: amount(value.duration_api_ms), modelUsage: record(value.modelUsage),
     };
   } catch {
-    return { finalMessage: stdout.trim() ? stdout.trim().slice(0, 20_000) : null, turns: null, usage: null, isError: null };
+    return { finalMessage: stdout.trim() ? stdout.trim().slice(0, 20_000) : null, turns: null, usage: null, isError: null, totalCostUsd: null, durationMs: null, durationApiMs: null, modelUsage: null };
   }
 }
 
@@ -132,9 +135,10 @@ export function managedRun(input: ManagedRunInput) {
     settingsDirectory = mkdtempSync(join(tmpdir(), 'optimizer-run-'));
     const settings = join(settingsDirectory, 'settings.json');
     writeFileSync(settings, JSON.stringify(managedSettings(input.hook, input.runtimeBin), null, 2) + '\n', { mode: 0o600 });
+    const systemPrompt = protocol(root, session.id, summary, `${checkpoint.decision}: ${checkpoint.reason}`, checkpoint.tier === 'light' && checkpoint.decision === 'PROCEED');
     const agentStarted = performance.now();
     const agent = spawnSync(input.claude, [
-      '-p', '--settings', settings, '--append-system-prompt', protocol(root, session.id, summary, `${checkpoint.decision}: ${checkpoint.reason}`, checkpoint.tier === 'light' && checkpoint.decision === 'PROCEED'),
+      '-p', '--settings', settings, '--append-system-prompt', systemPrompt,
       '--max-turns', String(input.maxTurns), '--output-format', 'json', ...(input.claudeArgs ?? []),
     ], { cwd: root, input: input.prompt, encoding: 'utf8', shell: false, timeout: input.timeoutMs, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024, env: { ...process.env, OPTIMIZER_MODE: 'managed', OPTIMIZER_MANAGED_RUN: '1' } });
     const agentMs = performance.now() - agentStarted;
@@ -142,6 +146,10 @@ export function managedRun(input: ManagedRunInput) {
     const report = agentReport(agent.stdout ?? '');
     const verifyStarted = performance.now();
     runtime = new Runtime(root);
+    runtime.recordAgentUsage(session.id, {
+      systemPromptBytes: Buffer.byteLength(systemPrompt), turns: report.turns, totalCostUsd: report.totalCostUsd,
+      durationMs: report.durationMs, durationApiMs: report.durationApiMs, usage: report.usage, modelUsage: report.modelUsage,
+    });
     const verified = runtime.verify(session.id);
     const verifyMs = performance.now() - verifyStarted;
     return {
@@ -151,6 +159,7 @@ export function managedRun(input: ManagedRunInput) {
       ...(agent.error && !timedOut ? { agentError: agent.error.message } : {}),
       turns: report.turns, usage: report.usage, agentReportedError: report.isError, finalMessage: report.finalMessage,
       timings: { startMs, agentMs, verifyMs, totalMs: performance.now() - started },
+      cost: runtime.cost(session.id),
     };
   } finally {
     runtime?.close();

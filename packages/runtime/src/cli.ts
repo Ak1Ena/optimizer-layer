@@ -51,7 +51,7 @@ Commands:
   blocked     --reason TEXT [--session ID] (hook only; records an exhausted Stop budget)
   status
   events      [--after SEQUENCE] [--limit COUNT]
-  metrics
+  metrics     (cost breakdown: agent usage, injected bytes, component and hook time, rework; raw measurements)
 All commands emit JSON. Goal/check/history files are explicitly selected inputs.
 Check commands run without a shell; shell metacharacters are rejected.
 OPTIMIZER_DISABLED=1 turns every Claude Code hook into a no-op.
@@ -229,7 +229,7 @@ function main(): unknown {
         if (limit < 1) throw new Error('limit must be positive');
         return runtime.events(sessionId).filter(item => item.sequence > after).slice(0, limit);
       }
-      case 'metrics': return runtime.measurements(sessionId);
+      case 'metrics': return { ...runtime.cost(sessionId), measurements: runtime.measurements(sessionId) };
       default: throw new Error(`Unknown command: ${command}`);
     }
   } finally {

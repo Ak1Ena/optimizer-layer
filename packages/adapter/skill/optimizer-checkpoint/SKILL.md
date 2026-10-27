@@ -33,7 +33,7 @@ At each safe checkpoint, request `optimizer next --project PROJECT --session SES
 - **escalate:** Stop dependent execution and show the human the runtime's reason and relevant evidence. Do not fabricate a strategy response or keep retrying after the reconsideration budget is exhausted.
 - **complete:** Report the verified requirement IDs and evidence, plus material limitations. Completion requires the runtime's `complete` action; tool activity and an agent claim are insufficient.
 
-After the implementation appears ready, record `claim`, request `next`, and follow the same checkpoint loop through independent verification. Use `metrics` for measured runtime overhead; unknown model tokens remain unknown.
+After the implementation appears ready, record `claim`, request `next`, and follow the same checkpoint loop through independent verification. Use `metrics` for the measured cost breakdown (runtime, hook and injected-context overhead, rework); unknown model tokens remain `null`.
 
 If a command fails without a JSON response, inspect stderr and correct the reported input or environment problem. If response JSON is malformed, output exceeds transport bounds, or the runtime cannot start, report the integration failure and preserve the existing session. Never interpret a transport failure as an acceptance failure or verified completion.
 

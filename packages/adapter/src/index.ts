@@ -66,3 +66,14 @@ export function runOptimizer(input: OptimizerInput): OptimizerResult {
     return { kind: 'protocol-error', exitCode: result.status, stderr, reason: 'Runtime did not return one valid JSON document' };
   }
 }
+
+/**
+ * Every model-visible text field of a Claude Code hook output, with their summed exact UTF-8 bytes.
+ * `systemMessage` is shown to the user only, so it is not counted.
+ */
+export function injected(output: Record<string, unknown> | undefined): { as: string[]; bytes: number } {
+  const specific = typeof output?.hookSpecificOutput === 'object' && output.hookSpecificOutput !== null ? output.hookSpecificOutput as Record<string, unknown> : {};
+  const fields: [string, unknown][] = [['additionalContext', specific.additionalContext], ['permissionDecisionReason', specific.permissionDecisionReason], ['reason', output?.decision === 'block' ? output.reason : undefined]];
+  const shown = fields.filter((field): field is [string, string] => typeof field[1] === 'string');
+  return { as: shown.map(([as]) => as), bytes: shown.reduce((total, [, value]) => total + Buffer.byteLength(value), 0) };
+}

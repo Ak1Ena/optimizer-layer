@@ -122,6 +122,11 @@ assert.equal(greeting('Ada'), 'Hello Ada');
   assert.ok(Array.isArray(events));
   assert.equal(events.length, 2);
   const metrics = checkpoint('metrics');
-  assert.ok(Array.isArray(metrics));
-  assert.ok(metrics.length > 0);
+  const measurements = property(metrics, 'measurements');
+  assert.ok(Array.isArray(measurements));
+  assert.ok(measurements.length > 0);
+  assert.equal(property(property(metrics, 'agent'), 'inputTokens'), null, 'no agent usage outside a managed run');
+  // One challenge and two acceptances.
+  assert.equal(property(property(metrics, 'rework'), 'agentReviews'), 3);
+  assert.equal(property(property(metrics, 'rework'), 'challenges'), 1);
 });
