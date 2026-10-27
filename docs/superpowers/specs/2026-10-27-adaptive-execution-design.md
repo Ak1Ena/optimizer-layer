@@ -94,6 +94,44 @@ Metrics: verified goal satisfaction (hidden test), false "done" claims, total to
 
 Harness: `scripts/benchmark-run.mjs` and `scripts/benchmark-report.mjs` over the tasks in `examples/benchmark/` (see its README). Arm B is today's mandatory gates on every task, forced with `optimizer run --tier standard` (recorded as `tier.decided standard`, trigger `forced by run option`); arm C is plain `optimizer run`.
 
+### Supervision loop (next stage; not implemented)
+
+The optimizer supervises; it does not search for the agent. The agent keeps its own search tools (Read, Grep, LSP, subagents); a retrieval router is not built, because duplicating the agent's search adds cost without new information. Context Intelligence moves from *retrieving* to *observing what the agent has read* and nudging only when something relevant is missing.
+
+```mermaid
+flowchart TD
+  G[User goal] --> C[Optimizer: goal contract + policy]
+  C --> W[Working agent]
+  W <--> S[Agent's own search tools]
+  W --> E[Agent execution]
+  E --> O[Optimizer observes outcomes]
+  O --> N{Need intervention?}
+  N -- no --> W
+  N -- guidance --> F[Focused guidance / required checkpoint] --> W
+  N -- human decision --> H[Ask the human] --> W
+  E -- agent claims done --> V[Independent verification: approved checks on current source]
+  V -- passed --> D[Verified: session closed]
+  V -- failed --> O
+```
+
+"Need intervention?" is decided from cheap, observable signals only. No signal, no intervention, no injected text:
+
+| Signal | Source | Intervention |
+|---|---|---|
+| Check failed; same failure twice | check evidence | replanning checkpoint (escalate tier) |
+| Done claimed before checks pass | Stop hook, claim event | run verification; block Stop until verified or budget spent |
+| Edit outside goal scope or into optimizer state | PreToolUse target | deny (state) or one-line scope reminder |
+| Open human question, or change to approved checks | goal uncertainties, proposals | ask the human |
+| Ambiguous task and a decision/doc file likely answers it, not yet read by the agent | goal terms vs files the agent has read (PostToolUse) | one-line pointer: "`docs/decisions.md` likely decides this; it has not been read" |
+| Turn or token budget for the task nearly spent | `agent.usage`, hook counts | one-line warning; at the limit, Stop with a report |
+
+Cost rules for the loop:
+- Observation is record-only and spawn-free on the common path (no runtime process when no signal fires); guidance is at most one short line, counted in injected bytes.
+- PostToolUse observation records tool name and target path (never file contents or tool output) for Read, Grep, Glob and Bash reads, so the "not yet read" signal is possible. Its per-call latency must be measured before it is enabled by default.
+- Every intervention is recorded with its signal, so the benchmark attributes its cost and value.
+
+Order: run the benchmark on the current implementation first (it shows how much cost is checkpoint overhead versus the agent's own searching); then build the PostToolUse observer and the "not yet read" guidance, judged on the ambiguous benchmark tasks (`invoice-total`, `dedupe-users`) against the first benchmark results.
+
 ## Acceptance criteria
 
 - AC1: On straightforward tasks, C's median tokens and wall-clock are within 1.25× of A, with equal or better verified satisfaction.
@@ -101,12 +139,14 @@ Harness: `scripts/benchmark-run.mjs` and `scripts/benchmark-report.mjs` over the
 - AC3: Every run reports the cost categories above, with `null` where no real measurement exists.
 - AC4: No policy constraint above is bypassed on any tier (regression tests).
 - AC5: No efficiency claim in README or release notes until benchmark results support it.
+- AC6 (supervision loop): with the observer enabled, C's verified satisfaction on ambiguous tasks rises above the first benchmark's C without breaking AC1, and the observer adds no runtime process on tool calls where no signal fires.
 
 ## Decisions (user, 2026-10-27)
 
 - Q1: Target is within 1.25× of the plain agent on straightforward tasks (AC1 as written).
 - Q2: Yes. The light tier records assessment and review as policy-satisfied, with the justifying rule, and asks no agent turn when approved checks define acceptance.
 - Q3: Benchmark size is decided after the light tier is implemented and local tests pass. No paid run before that decision.
+- Supervision loop (user diagram): adopted, with an explicit verification gate, a path to the human, and the intervention signals above. No retrieval router; the agent keeps its own search.
 
 ## Open questions
 
