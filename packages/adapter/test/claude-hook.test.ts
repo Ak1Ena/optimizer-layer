@@ -8,6 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 // Enabling and disabling need user proof (an interactive terminal or an approval prompt); fixtures act as the user in-process.
 import { disableProject, enableProject } from '../../runtime/src/project.ts';
+import { optimizerHookOnly } from '../../runtime/src/bash.ts';
+import { hookOnly } from '../src/bash-guard.ts';
 
 const hookScript = fileURLToPath(new URL('../src/claude-hook.ts', import.meta.url));
 const runtimeCli = fileURLToPath(new URL('../../runtime/src/cli.ts', import.meta.url));
@@ -136,6 +138,53 @@ test('without an active session PreToolUse and Stop stay silent and never spawn 
   assert.deepEqual(hook({ hook_event_name: 'Stop', stop_hook_active: false }, project, unspawnable), { output: undefined, stderr: '' });
   assert.deepEqual(hook(edit(join(project, '.optimizer', 'project.json')), project, unspawnable).output, deny('optimizer: runtime state is written only by the optimizer runtime and hook.'));
   assert.deepEqual(hook(edit(join(project, 'sub', '.optimizer', 'project.json')), project, unspawnable).output, deny('optimizer: runtime state is written only by the optimizer runtime and hook.'), 'nested project state is protected too');
+});
+
+test('the hook Bash guard and the runtime classifier agree on hook-only subcommands', () => {
+  assert.deepEqual([...hookOnly].sort(), [...optimizerHookOnly].sort());
+});
+
+test('the spawn-free Bash guard denies optimizer hook-only invocations and state access, not ordinary commands', t => {
+  const { project, hook } = setup(t);
+  const bash = (command: string) => hook({ hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command } }, project, { OPTIMIZER_BIN: '/optimizer-does-not-exist' }).output;
+  // False positives of the old substring guard: repo paths, prompt files, $PATH, $? and unrelated dynamic commands.
+  for (const command of [
+    'echo $?', 'npm test; echo "exit $?"', 'env PATH=/opt/node/bin:$PATH npm test', 'printf x > prompt.txt',
+    'cd /home/u/code/optimizer-layer && cat prompt.txt', 'node /home/u/optimizer-layer/scripts/demo.mjs --prompt-file prompt.txt',
+    'grep -rn enable /home/u/optimizer-layer/packages/runtime/src/cli.ts', 'cat packages/runtime/src/cli.ts | grep prompt',
+    'optimizer status --project /p --session S', 'cat packages/adapter/src/claude-hook.ts',
+    'for f in *.ts; do wc -l "$f"; done', 'X=$(git rev-parse HEAD); echo "$X"', 'bash -c "$CMD"', 'ls | xargs grep -l TODO',
+    '[ -f prompt.txt ] && cat prompt.txt', 'sh -c "npm test && echo ok"', 'bash scripts/setup.sh', 'ls ~/code/optimizer-layer/packages',
+    // Here-document bodies fed to a non-interpreter are data; `npm run` beside a permitted optimizer call is fine.
+    "git commit -m \"$(cat <<'EOF'\nfix optimizer prompt handling\nEOF\n)\"", "cat <<'EOF' > notes.md\nrun optimizer prompt docs\nEOF\nnpm test",
+    'cat .optimizer/drafts/*.md', 'rm -rf dist/*', 'optimizer check --project . --session S --check c1 && npm run build',
+    'optimizer resolve --project . --session S --question Q1 --source prompt:abc',
+  ]) {
+    assert.equal(bash(command), undefined, command);
+  }
+  // Bypasses: wrappers, separators, splices, escapes, variables, substitutions, eval, piped shells, xargs, globs, the hook itself.
+  for (const command of [
+    'optimizer run --project . --prompt-file p', 'optimizer start-from-prompt --prompt 1', 'optimizer blocked --reason x',
+    'npx optimizer enable', 'npx @optimizer-layer/runtime enable', 'env -i optimizer disable', 'command optimizer enable', 'timeout 5 optimizer enable',
+    'node node_modules/@optimizer-layer/runtime/dist/cli.js disable', 'true || optimizer enable', 'echo | optimizer enable', 'true\noptimizer enable',
+    '(optimizer enable)', 'sh -c "optimizer enable"', "bash -lc 'optimizer disable'", 'env -S "optimizer enable"', 'eval "optimizer enable"',
+    'o""ptimizer enable', 'optim\\izer enable', "$'\\x6fptimizer' enable", '$(which optimizer) enable', '`which optimizer` enable', '$X enable',
+    'X=optim; Y=izer; Z=ena; W=ble; $X$Y $Z$W', 'X="optimizer enable"; $X', 'X=enable; optimizer "$X"', '$(printf optimizer) status',
+    'echo b3B0aW1pemVyIGVuYWJsZQ== | base64 -d | sh', 'echo enable | xargs optimizer', "echo 'optimizer enable' | xargs sh -c",
+    '/usr/local/bin/o?timizer enable', 'find . -exec optimizer enable \\;', 'echo "$(optimizer enable)"',
+    'cat ~/.config/optimizer-layer/projects/x.json', "cat $'\\x2eoptimizer/project.json'", 'node packages/adapter/src/claude-hook.ts',
+    // Interpreter program strings, renames and aliases, script files: an optimizer name plus a hook-only word anywhere.
+    `python3 -c "import subprocess;subprocess.run(['optimizer','enable'])"`, `perl -e 'system("optimizer enable")'`,
+    `node -e "require('child_process').execSync('optimizer enable')"`, `python3 -c "import os;os.system('optimizer enable')"`,
+    'ln -s $(command -v optimizer) /tmp/o; /tmp/o enable', 'cp $(which optimizer) /tmp/o && /tmp/o disable', 'alias o=optimizer; o enable',
+    'printf %s optimizer | xargs -I{} {} enable', "printf 'optimizer enable' > x.sh; sh x.sh", "echo 'optimizer enable' > x.sh && bash x.sh",
+    // Here-documents fed to a shell or interpreter are still read.
+    'sh <<EOF\noptimizer enable\nEOF', "bash <<'EOF'\nX=optim; Y=izer; $X$Y disable\nEOF", 'python3 - <<EOF\nimport os; os.system("optimizer enable")\nEOF',
+    // Globs and brace lists that can expand to optimizer state.
+    'cat .opt*/project.json', 'cat .{opti,x}mizer/project.json', 'rm -rf $HOME/.opt*', 'cat ~/.config/optimizer-*/projects/x.json', 'cat .optimizer/dr*/x',
+  ]) {
+    assert.deepEqual(bash(command), deny('optimizer: prompt capture, project enablement and runtime state belong to the user and the Claude Code hook.'), command);
+  }
 });
 
 test('a committed .optimizer/project.json neither disables the hooks nor supplies checks', t => {

@@ -6,6 +6,7 @@ import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { runOptimizer, type OptimizerCommand } from './index.ts';
+import { deniedBash } from './bash-guard.ts';
 
 type Output = Record<string, unknown> | undefined;
 interface Current { sessionId: string | null; checkpoint: Decision | null; summary: string; checks: string[][]; pending: { code: string; argv: string[][] } | null }
@@ -229,11 +230,7 @@ function preToolUse(root: string, cwd: string, tool: string, toolInput: Record<s
   let input = toolInput;
   if (tool === 'Bash') {
     // Spawn-free and best effort: it also covers folders where the runtime never starts; the runtime gate applies the full classifier.
-    // Quotes and backslashes removed, so words spliced from quoted pieces (`ena""ble`) still match.
-    const command = (text(input.command) ?? '').replace(/["'\\]/g, '');
-    // Variables or substitutions next to the runtime name could spell any command, so they are refused too.
-    const control = /optimizer|cli\.ts/.test(command) && (/\b(enable|disable|prompt)\b(?!:)/.test(command) || /[$`]/.test(command));
-    if (control || /optimizer-claude-hook|optimizer-layer\/projects|\.optimizer(?![\w-])(?!\/drafts\/)/.test(command)) return deny('optimizer: prompt capture, project enablement and runtime state belong to the user and the Claude Code hook.');
+    if (deniedBash(text(input.command) ?? '')) return deny('optimizer: prompt capture, project enablement and runtime state belong to the user and the Claude Code hook.');
     // The runtime classifies cd and git against the shell's working directory.
     input = { ...input, cwd: real(cwd) };
   } else {
