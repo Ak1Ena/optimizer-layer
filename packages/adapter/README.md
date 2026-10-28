@@ -9,7 +9,7 @@ Build and pack from the repository root:
 ```sh
 npm run build
 npm pack ./dist/npm/adapter
-npm install /absolute/path/to/optimizer-layer-agent-adapter-0.3.0.tgz
+npm install /absolute/path/to/optimizer-layer-agent-adapter-0.4.0.tgz
 ```
 
 Install the runtime package separately and configure its absolute executable path. For Codex, copy the packaged `skill/optimizer-checkpoint` directory into your chosen skill directory (normally `~/.codex/skills/optimizer-checkpoint`), then start a new session. Other coding agents can load the same `SKILL.md` as explicit task instructions. For Claude Code, copy it to `~/.claude/skills/optimizer-checkpoint`. The `optimizer` and `optimizer-mcp` binaries use `#!/usr/bin/env node`; if the agent's default `node` is older than 24.18, `node:sqlite` is missing, so put a wrapper on `PATH` that runs the binary with an explicit Node.js 24 executable. The package modifies host configuration only when you run `optimizer-claude-hook install`, and installs no background service.

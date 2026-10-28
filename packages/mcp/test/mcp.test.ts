@@ -48,7 +48,7 @@ test('official SDK initializes stdio server and exposes only two annotated read-
   t.after(() => runtime.close());
   const client = await connect(t, projectRoot);
   assert.equal(LATEST_PROTOCOL_VERSION, '2025-11-25');
-  assert.deepEqual(client.getServerVersion(), { name: 'optimizer-layer', version: '0.3.0' });
+  assert.deepEqual(client.getServerVersion(), { name: 'optimizer-layer', version: '0.4.0' });
   const tools = await client.listTools();
   assert.deepEqual(tools.tools.map(tool => tool.name).sort(), ['optimizer_session_events', 'optimizer_session_status']);
   assert.ok(tools.tools.every(tool => tool.annotations?.readOnlyHint === true && tool.annotations.destructiveHint === false));
