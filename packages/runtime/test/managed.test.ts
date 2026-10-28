@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
+import { pathToFileURL } from 'node:url';
+import { buildConflicts, runtimeBuild, sourceBuildId } from '../src/managed.ts';
 import { gate, Runtime } from '../src/runtime.ts';
 import { appendCapturedPrompt, capturedPrompts, promptLogPath } from '../src/context.ts';
 import { enableProject, readProjectConfig, writeProjectConfig } from '../src/project.ts';
@@ -14,6 +16,8 @@ const home = realpathSync(mkdtempSync(join(tmpdir(), 'optimizer-home-')));
 process.env.HOME = home;
 process.env.XDG_CONFIG_HOME = join(home, 'config');
 delete process.env.OPTIMIZER_MODE;
+// Managed runs read the user's Claude Code settings; keep them in the temporary HOME.
+delete process.env.CLAUDE_CONFIG_DIR;
 test.after(() => rmSync(home, { recursive: true, force: true }));
 
 const request = 'Make parseCount throw RangeError for negative values and keep returning numbers otherwise.';
@@ -352,4 +356,113 @@ test('--claude-args appends plain arguments without a shell and refuses metachar
     assert.match(refused.stderr, /claude-args/, bad);
   }
   assert.equal(existsSync(log), false, 'refused arguments never launch the agent');
+});
+
+test('one build per run: the agent\'s own `optimizer` is this build, and a Claude Code hook running another build refuses the run', (t) => {
+  const { directory, project, checker, log } = setup(t);
+  enableProject(project, { commands: [`node ${checker} ${project}`], timeoutMs: 5000, yes: false });
+  const script = (name: string, body: string) => {
+    const path = join(directory, name);
+    writeFileSync(path, body, { mode: 0o755 });
+    return path;
+  };
+  // An installed optimizer from another build first on PATH, and one too old to report a build at all.
+  mkdirSync(join(directory, 'stale'));
+  const other = script('stale/optimizer', `#!/bin/sh\necho '{"build":"another"}'\n`);
+  const old = script('old-optimizer', `#!/bin/sh\necho '{"error":"Unknown command: build"}'\nexit 1\n`);
+  // Same build behind a different wrapper path: build identity, not the path, decides.
+  const same = script('same-optimizer', `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(cli)} "$@"\n`);
+  const agent = script('agent.mjs', `#!${process.execPath}
+import { spawnSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
+writeFileSync(process.env.FAKE_LOG, spawnSync('optimizer', ['--help'], { encoding: 'utf8' }).stdout);
+process.stdout.write(JSON.stringify({ type: 'result', is_error: false, result: 'Finished.', num_turns: 1 }));
+`);
+  const promptFile = script('prompt.txt', request);
+  const userSettings = join(home, '.claude', 'settings.json');
+  mkdirSync(dirname(userSettings), { recursive: true });
+  t.after(() => rmSync(userSettings, { force: true }));
+  const hooks = (...bins: string[]) => writeFileSync(userSettings, JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Edit|Write', hooks: bins.map(bin => ({ type: 'command', command: `OPTIMIZER_MODE='always-on' OPTIMIZER_BIN='${bin}' node '/x/claude-hook.js'` })) }] } }));
+  const run = () => {
+    rmSync(log, { force: true });
+    const config = readProjectConfig(project);
+    assert.ok(config);
+    writeProjectConfig(project, { ...config, activeSessionId: null });
+    return spawnSync(process.execPath, [cli, 'run', '--project', project, '--prompt-file', promptFile, '--claude', agent, '--hook', hookScript], {
+      encoding: 'utf8', env: { ...process.env, OPTIMIZER_BIN: join(directory, 'optimizer'), FAKE_LOG: log, PATH: `${dirname(other)}${delimiter}${process.env.PATH}` },
+    });
+  };
+
+  run();
+  assert.equal(readFileSync(log, 'utf8'), spawnSync(join(directory, 'optimizer'), ['--help'], { encoding: 'utf8' }).stdout, 'the agent\'s `optimizer` resolves to the run\'s build despite PATH');
+
+  hooks(other, old);
+  const refused = run();
+  assert.equal(refused.status, 1);
+  assert.match(refused.stderr, /another optimizer build would also run/);
+  assert.ok(refused.stderr.includes(`${other} (set in ${userSettings}) is build another`), refused.stderr);
+  assert.ok(refused.stderr.includes(`${old} (set in ${userSettings}) is a build that cannot report its identity`), refused.stderr);
+  assert.equal(existsSync(log), false, 'the agent was never launched');
+
+  hooks(same);
+  run();
+  assert.equal(existsSync(log), true, 'a hook on the same build at another path is allowed');
+});
+
+test('build identity: sources and a dist built from them agree, only .ts content counts, a dist without an id fails closed', (t) => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'optimizer-build-')));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const source = resolve('packages/runtime/src');
+  const own = runtimeBuild();
+  assert.equal(sourceBuildId(source), own);
+  const copy = join(directory, 'src');
+  cpSync(source, copy, { recursive: true, filter: path => !path.endsWith('.DS_Store') });
+  for (const noise of ['.DS_Store', 'cli.js.map', '.managed.ts.swp']) writeFileSync(join(copy, noise), 'noise');
+  assert.equal(sourceBuildId(copy), own, 'OS, map and swap files are ignored');
+  writeFileSync(join(copy, 'cli.ts'), readFileSync(join(copy, 'cli.ts'), 'utf8') + '\n// changed\n');
+  assert.notEqual(sourceBuildId(copy), own, 'a source change is a new build');
+  // What `npm run build` produces: dist modules beside a build-id file written from the sources.
+  const dist = join(directory, 'dist');
+  mkdirSync(dist);
+  const distModule = pathToFileURL(join(dist, 'managed.js')).href;
+  assert.throws(() => runtimeBuild(distModule), /ENOENT/, 'no build-id: identity unknown');
+  writeFileSync(join(dist, 'build-id'), 'garbage\n');
+  assert.throws(() => runtimeBuild(distModule), /not a build id/);
+  writeFileSync(join(dist, 'build-id'), sourceBuildId(source) + '\n');
+  assert.equal(runtimeBuild(distModule), own);
+});
+
+test('build conflicts: repository settings are compared without executing, relative and unreadable settings refuse', (t) => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'optimizer-conflicts-')));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const userDirectory = join(home, '.claude');
+  mkdirSync(userDirectory, { recursive: true });
+  t.after(() => {
+    for (const name of ['settings.json', 'settings.local.json']) rmSync(join(userDirectory, name), { force: true });
+  });
+  const bin = join(directory, 'optimizer');
+  writeFileSync(bin, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(cli)} "$@"\n`, { mode: 0o755 });
+  // Executing this would leave a marker: repository settings must never run it.
+  const marker = join(directory, 'executed');
+  const planted = join(directory, 'planted');
+  writeFileSync(planted, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\necho '{"build":"${runtimeBuild()}"}'\n`, { mode: 0o755 });
+  const project = join(directory, 'project');
+  mkdirSync(join(project, '.claude'), { recursive: true });
+  const hook = (command: string) => ({ hooks: { Stop: [{ hooks: [{ type: 'command', command }] }] } });
+  assert.deepEqual(buildConflicts(bin, project), [], 'nothing configured');
+
+  writeFileSync(join(project, '.claude', 'settings.json'), JSON.stringify(hook(`OPTIMIZER_BIN="${planted}" node /x/claude-hook.js`)));
+  const repository = buildConflicts(bin, project);
+  assert.equal(repository.length, 1);
+  assert.match(repository[0] ?? '', /set in repository settings .*not executed/);
+  assert.equal(existsSync(marker), false, 'the repository OPTIMIZER_BIN was never executed');
+  writeFileSync(join(project, '.claude', 'settings.json'), JSON.stringify({ env: { OPTIMIZER_BIN: bin }, ...hook(`OPTIMIZER_BIN=${bin} node /x/claude-hook.js`) }));
+  assert.deepEqual(buildConflicts(bin, project), [], 'the run\'s own runtime in repository settings is fine');
+  rmSync(join(project, '.claude', 'settings.json'));
+
+  writeFileSync(join(userDirectory, 'settings.json'), JSON.stringify({ env: { OPTIMIZER_BIN: 'optimizer' }, ...hook(`node /x/other-tool/claude-hook.js; echo OPTIMIZER_BIN`) }));
+  assert.deepEqual(buildConflicts(bin), ['OPTIMIZER_BIN "optimizer" in ' + join(userDirectory, 'settings.json') + ' is not an absolute path'], 'relative refused; a mention is not a setting');
+  writeFileSync(join(userDirectory, 'settings.json'), JSON.stringify(hook(`OPTIMIZER_MODE='always-on' OPTIMIZER_BIN='${bin}' node /x/claude-hook.js`)));
+  writeFileSync(join(userDirectory, 'settings.local.json'), '{ not json');
+  assert.deepEqual(buildConflicts(bin), [`${join(userDirectory, 'settings.local.json')} is not a readable settings object, so its hooks cannot be checked`]);
 });

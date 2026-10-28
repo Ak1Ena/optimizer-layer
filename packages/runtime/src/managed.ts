@@ -1,7 +1,9 @@
 import { spawnSync } from 'node:child_process';
-import { accessSync, constants, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { delimiter, isAbsolute, join } from 'node:path';
+import { createHash } from 'node:crypto';
+import { accessSync, constants, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { delimiter, dirname, isAbsolute, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { appendCapturedPrompt } from './context.ts';
 import { managedProject } from './controller.ts';
 import { readProjectConfig, sessionSummary } from './project.ts';
@@ -50,6 +52,91 @@ export function findExecutable(name: string): string | null {
     }
   }
   return null;
+}
+
+/** Hash of the runtime's TypeScript sources (`.ts` files only, so editor and OS files never change it). */
+export function sourceBuildId(directory: string): string {
+  const hash = createHash('sha256');
+  for (const name of readdirSync(directory).filter(item => item.endsWith('.ts')).sort()) {
+    const path = join(directory, name);
+    if (statSync(path).isFile()) hash.update(`${name}\0`).update(readFileSync(path)).update('\0');
+  }
+  return hash.digest('hex');
+}
+
+/**
+ * This runtime's build identity, the same for the sources and for a dist built from them (`npm run build` writes
+ * `build-id`): two installs that report the same version can still differ. A dist without `build-id` throws.
+ */
+export function runtimeBuild(moduleUrl: string = import.meta.url): string {
+  const directory = dirname(fileURLToPath(moduleUrl));
+  if (moduleUrl.endsWith('.ts')) return sourceBuildId(directory);
+  const id = readFileSync(join(directory, 'build-id'), 'utf8').trim();
+  if (!/^[0-9a-f]{64}$/.test(id)) throw new Error(`${join(directory, 'build-id')} is not a build id`);
+  return id;
+}
+
+const realpath = (path: string): string | null => {
+  try {
+    return realpathSync(path);
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Optimizer executables that would also run during a managed run but are not this build: the hooks' runtime and every
+ * OPTIMIZER_BIN that the Claude Code settings the agent loads set, in hook commands or the env block. User settings
+ * are probed with `build`; a repository's own `.claude` settings are never executed, only compared by real path.
+ * A build that cannot report its identity counts as a conflict.
+ */
+export function buildConflicts(runtimeBin: string, root?: string): string[] {
+  const own = runtimeBuild();
+  const ours = realpath(runtimeBin);
+  const user = process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude');
+  const files = [
+    ...['settings.json', 'settings.local.json'].map(name => ({ file: join(user, name), trusted: true })),
+    ...(root ? ['settings.json', 'settings.local.json'].map(name => ({ file: join(root, '.claude', name), trusted: false })) : []),
+  ];
+  const probes = new Map<string, string>([[runtimeBin, 'the managed hooks']]);
+  const conflicts: string[] = [];
+  for (const { file, trusted } of files.filter(item => existsSync(item.file))) {
+    let settings: Record<string, unknown> | null;
+    try {
+      settings = record(JSON.parse(readFileSync(file, 'utf8')));
+    } catch {
+      settings = null;
+    }
+    if (!settings) {
+      conflicts.push(`${file} is not a readable settings object, so its hooks cannot be checked`);
+      continue;
+    }
+    const commands = Object.values(record(settings.hooks) ?? {}).flatMap(groups => Array.isArray(groups) ? groups : [])
+      .flatMap(group => { const inner = record(group)?.hooks; return Array.isArray(inner) ? inner : []; })
+      .map(hook => record(hook)?.command).filter(command => typeof command === 'string');
+    const fromEnv = record(settings.env)?.OPTIMIZER_BIN;
+    const bins = [
+      ...(fromEnv === undefined ? [] : [String(fromEnv)]),
+      // Only a hook that sets OPTIMIZER_BIN runs the optimizer; one that merely mentions it does not.
+      ...commands.flatMap(command => [...command.matchAll(/(?:^|[\s;&|])OPTIMIZER_BIN=('[^']*'|"[^"]*"|[^\s;&|'"]*)/g)].map(match => (match[1] ?? '').replace(/^(['"])(.*)\1$/, '$2'))),
+    ];
+    for (const bin of bins) {
+      if (!isAbsolute(bin)) conflicts.push(`OPTIMIZER_BIN ${JSON.stringify(bin)} in ${file} is not an absolute path`);
+      else if (trusted) probes.set(bin, `set in ${file}`);
+      else if (ours === null || realpath(bin) !== ours) conflicts.push(`${bin} (set in repository settings ${file}; not executed) is not this run's runtime ${runtimeBin}`);
+    }
+  }
+  for (const [bin, source] of probes) {
+    const probe = spawnSync(bin, ['build'], { encoding: 'utf8', timeout: 15_000, killSignal: 'SIGKILL', env: { PATH: process.env.PATH ?? '' } });
+    let build: unknown;
+    try {
+      build = (JSON.parse(probe.stdout) as { build?: unknown }).build;
+    } catch {
+      build = undefined;
+    }
+    if (build !== own) conflicts.push(`${bin} (${source}) is ${typeof build === 'string' ? `build ${build.slice(0, 12)}` : 'a build that cannot report its identity'}, not this build ${own.slice(0, 12)}`);
+  }
+  return conflicts;
 }
 
 /** Private settings whose hooks always enforce, whatever mode the user's global install uses. */
@@ -119,6 +206,9 @@ export function managedRun(input: ManagedRunInput) {
     if (!isAbsolute(path)) throw new Error(`${name} executable must be an absolute path`);
   }
   accessSync(input.runtimeBin, constants.X_OK);
+  // Another build reading this run's state fails on events it does not know and fails closed, denying the agent's work.
+  const conflicts = buildConflicts(input.runtimeBin, root);
+  if (conflicts.length) throw new Error(`optimizer run refused: another optimizer build would also run: ${conflicts.join('; ')}. Point those hooks and OPTIMIZER_BIN at this build, or remove them, then retry.`);
   let runtime: Runtime | null = new Runtime(root);
   let settingsDirectory: string | null = null;
   try {
@@ -137,12 +227,16 @@ export function managedRun(input: ManagedRunInput) {
     settingsDirectory = mkdtempSync(join(tmpdir(), 'optimizer-run-'));
     const settings = join(settingsDirectory, 'settings.json');
     writeFileSync(settings, JSON.stringify(managedSettings(input.hook, input.runtimeBin), null, 2) + '\n', { mode: 0o600 });
+    // The agent's own `optimizer` commands (from the protocol) must reach this build, not whichever is first on PATH.
+    const agentBin = join(settingsDirectory, 'bin');
+    mkdirSync(agentBin);
+    writeFileSync(join(agentBin, 'optimizer'), `#!/bin/sh\nexec ${quote(input.runtimeBin)} "$@"\n`, { mode: 0o755 });
     const systemPrompt = protocol(root, session.id, summary, `${checkpoint.decision}: ${checkpoint.reason}`, checkpoint.tier === 'light' && checkpoint.decision === 'PROCEED');
     const agentStarted = performance.now();
     const agent = spawnSync(input.claude, [
       '-p', '--settings', settings, '--append-system-prompt', systemPrompt,
       '--max-turns', String(input.maxTurns), '--output-format', 'json', ...(input.claudeArgs ?? []),
-    ], { cwd: root, input: input.prompt, encoding: 'utf8', shell: false, timeout: input.timeoutMs, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024, env: { ...process.env, OPTIMIZER_MODE: 'managed', OPTIMIZER_MANAGED_RUN: '1' } });
+    ], { cwd: root, input: input.prompt, encoding: 'utf8', shell: false, timeout: input.timeoutMs, killSignal: 'SIGKILL', maxBuffer: 16 * 1024 * 1024, env: { ...process.env, PATH: [agentBin, process.env.PATH].filter(Boolean).join(delimiter), OPTIMIZER_BIN: input.runtimeBin, OPTIMIZER_MODE: 'managed', OPTIMIZER_MANAGED_RUN: '1' } });
     const agentMs = performance.now() - agentStarted;
     const timedOut = agent.error !== undefined && 'code' in agent.error && agent.error.code === 'ETIMEDOUT';
     const report = agentReport(agent.stdout ?? '');

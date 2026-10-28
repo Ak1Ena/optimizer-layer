@@ -32,6 +32,8 @@ node scripts/benchmark-run.mjs --tasks 8 --reps 3 --model sonnet --out benchmark
 node scripts/benchmark-report.mjs benchmark-results/small/results.jsonl
 ```
 
+One runtime build per benchmark: real Claude Code also loads your own Claude Code hooks, and a different optimizer build reading a run's state fails closed and denies the agent's edits. Before any arm runs, the runner compares the build id (`optimizer build`, a hash of `packages/runtime/src`; an installed dist reports the id of the sources it was built from) of this checkout with every absolute `OPTIMIZER_BIN` set in `~/.claude/settings.json` and `settings.local.json` (hooks and `env`). It refuses with `benchmark refused: another optimizer build would also run` while any of them, for example always-on hooks from an older global install, reports another id or none. Fix it by reinstalling the global optimizer from this checkout (`npm run build`, `npm pack ./dist/npm/runtime ./dist/npm/adapter`, `npm install -g` those two tarballs, then `optimizer-claude-hook install` again with the same mode, e.g. `--always-on`), or by removing those hooks for the duration of the benchmark. `optimizer run` applies the same check to every run.
+
 Options: `--claude PATH` (`fake` = `fake-claude.mjs`), `--model NAME`, `--max-turns N` (30), `--timeout-ms N` (900000 per run), `--claude-args="..."` (default `--permission-mode acceptEdits --allowedTools Bash`), `--out DIR` (`benchmark-results`), `--keep` (keep the run copies). Re-running with the same `--out` skips rows already in `results.jsonl`, so an interrupted run resumes. Arm order rotates per rep.
 
 ## What a row records (real sources only; missing values stay `null`)

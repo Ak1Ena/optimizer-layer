@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { readFileSync, realpathSync, statSync } from 'node:fs';
 import { isAbsolute, resolve } from 'node:path';
-import { claudeArgs, findExecutable, managedRun } from './managed.ts';
+import { claudeArgs, findExecutable, managedRun, runtimeBuild } from './managed.ts';
 import { parseArgs, type ParseArgsOptionsConfig } from 'node:util';
 import { gate, Runtime } from './runtime.ts';
 import { sameSecret } from './user-store.ts';
@@ -11,6 +11,7 @@ import { maxCheckTimeoutMs, parseAssessment, parseReviewResponse } from './schem
 
 const usage = `optimizer COMMAND --project PATH [--session ID]
 optimizer dashboard [--port N]   (local read-only web page; default port 8790, 0 picks a free one)
+optimizer build                  (content hash of this runtime build; \`optimizer run\` refuses other builds)
 optimizer run --project PATH --prompt-file F [--max-turns N] [--timeout-ms N] [--claude PATH] [--hook PATH]
               [--tier standard] (operator-only: skip the light tier; recorded as tier.decided
               standard, trigger "forced by run option")
@@ -96,7 +97,7 @@ function main(): unknown {
   }
   const [command, ...extra] = parsed.positionals;
   if (extra.length) throw new Error('Unexpected positional arguments');
-  const commands = new Set(['init', 'dashboard', 'propose-check', 'enable', 'disable', 'prompt', 'current', 'start', 'history', 'retrieve', 'assess', 'review', 'resolve', 'next', 'check', 'reconsider', 'claim', 'verify', 'status', 'events', 'metrics', 'decide', 'gate', 'start-from-prompt', 'blocked', 'experiences', 'run']);
+  const commands = new Set(['init', 'dashboard', 'propose-check', 'enable', 'disable', 'prompt', 'current', 'start', 'history', 'retrieve', 'assess', 'review', 'resolve', 'next', 'check', 'reconsider', 'claim', 'verify', 'status', 'events', 'metrics', 'decide', 'gate', 'start-from-prompt', 'blocked', 'experiences', 'run', 'build']);
   if (!command || !commands.has(command)) throw new Error(`Unknown command: ${command ?? '(missing)'}`);
   const required = (name: string): string => {
     const input = parsed.values[name];
@@ -115,6 +116,7 @@ function main(): unknown {
     );
     return undefined;
   }
+  if (command === 'build') return { build: runtimeBuild() };
   const project = required('project');
   if (command === 'propose-check') {
     return proposeChecks(project, { commands: checkCommands(parsed.values.check), timeoutMs: timeoutMs(parsed.values['timeout-ms']) });

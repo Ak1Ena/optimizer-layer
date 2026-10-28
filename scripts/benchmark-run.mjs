@@ -10,7 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
-import { claudeArgs, findExecutable } from '../packages/runtime/src/managed.ts';
+import { buildConflicts, claudeArgs, findExecutable } from '../packages/runtime/src/managed.ts';
 import { commandArgv, enableProject } from '../packages/runtime/src/project.ts';
 
 const repoRoot = resolve(import.meta.dirname, '..');
@@ -68,6 +68,12 @@ mkdirSync(out, { recursive: true });
 const bin = join(out, 'optimizer');
 writeFileSync(bin, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(cli)} "$@"\n`);
 chmodSync(bin, 0o755);
+// `optimizer run` refuses this per run too; checking once here keeps arm A from spending quota first.
+const conflicts = buildConflicts(bin);
+if (conflicts.length) {
+  process.stderr.write(`benchmark refused: another optimizer build would also run:\n  ${conflicts.join('\n  ')}\nPoint those hooks at this checkout's build (or remove them) and retry.\n`);
+  process.exit(1);
+}
 
 const parse = text => {
   try {

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -97,4 +97,23 @@ test('benchmark runner and report on the fake claude: plan gate, A/B/C rows from
   assert.equal(empty.byArm.A.tokens.total.median, null);
   assert.equal(empty.byArm.A.costPerVerified, null);
   assert.equal(empty.ac1.pass, null);
+});
+
+test('benchmark runner refuses to start, before any arm runs, when a Claude Code hook would run another optimizer build', (t) => {
+  const directory = scratch(t, 'bench-refuse-');
+  const out = join(directory, 'out');
+  // An installed runtime too old to report its build (run1: a 0.3.0 dist without the tier.decided event).
+  const stale = join(directory, 'optimizer');
+  writeFileSync(stale, `#!/bin/sh\necho '{"error":"Unknown command: build"}'\nexit 1\n`, { mode: 0o755 });
+  mkdirSync(join(directory, '.claude'));
+  const settings = join(directory, '.claude', 'settings.json');
+  writeFileSync(settings, JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: `OPTIMIZER_MODE='always-on' OPTIMIZER_BIN='${stale}' node '/x/claude-hook.js'` }] }] } }));
+  const { OPTIMIZER_MODE: _, CLAUDE_CONFIG_DIR: __, ...inherited } = process.env;
+  const result = spawnSync(process.execPath, [runner, '--claude', 'fake', '--tasks', '4', '--reps', '1', '--out', out, '--yes'], {
+    encoding: 'utf8', env: { ...inherited, HOME: directory, XDG_CONFIG_HOME: join(directory, 'config') }, timeout: 300_000,
+  });
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(result.stderr, /benchmark refused: another optimizer build would also run/);
+  assert.ok(result.stderr.includes(`${stale} (set in ${settings}) is a build that cannot report its identity`), result.stderr);
+  assert.equal(existsSync(join(out, 'results.jsonl')), false, 'no arm ran');
 });
